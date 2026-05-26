@@ -383,119 +383,128 @@ def format_status_header(balances, positions):
 
 def entry_timing(symbol):
     """
-    入场时机评分（0~20分）：判断价格位置是否适合进场
-    - 价格在24h反弹中部 +8（看还有多少空间，不是20根K线位置）
-    - 15m短期向上 +4
-    - 回调止跌信号 +3
-    - 回调缩量 +3
-    - 不创新低 +3
-    - 连跌惩罚 -5
-    - 放量下跌惩罚 -5
+    趋势延续性评分（0~100分）：
+    判断一个币还能不能继续涨，能涨多少
+    - ≥60分 → 全仓开（10x/95u）
+    - 40~59分 → 半仓开（5x/55u）
+    - <40分 → 不开
     """
-    k15 = get_klines(symbol, "15m", 22)
-    if not k15 or len(k15) < 20:
-        return 10, "数据不足,保守入场"
-    price = k15[-1]["close"]
-
-    # 价格位置：看从24h最低点反弹了多少（相对涨幅启动前位置）
-    # 如果24h从$1.0涨到$1.2，当前$1.08 → 反弹了40%，还在低位→高分
+    k15 = get_klines(symbol, "15m", 12)
+    k1h = get_klines(symbol, "1h", 6)
     t24 = curl_get(f"https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={symbol}")
-    if t24:
-        low_24h = float(t24['lowPrice'])
-        high_24h = float(t24['highPrice'])
-        chg_24h = float(t24['priceChangePercent'])
-        # 24h最低到最高的完整区间
-        full_range = high_24h - low_24h
-        if full_range > 0 and low_24h > 0:
-            # 当前价格在24h区间中的位置（0~100%）
-            rebound_pct = (price - low_24h) / full_range * 100
-        else:
-            rebound_pct = 50
-    else:
-        rebound_pct = 50
+    if not k15 or not k1h or not t24 or len(k15) < 6 or len(k1h) < 4:
+        return 30, "数据不足,保守入场"  # 数据不足时保守
 
-    # 同时也算15m区间位置（做参考，但权重降低）
-    hi = max(c["high"] for c in k15[-20:])
-    lo = min(c["low"] for c in k15[-20:])
-    rng = hi - lo
-    pos_pct = (price - lo) / rng * 100 if rng > 0 else 50
-    s = 0; reasons = []
+    price = k15[-1]["close"]
+    high_24h = float(t24["highPrice"])
+    low_24h = float(t24["lowPrice"])
+    high_15m = max(c["high"] for c in k15)
+    low_15m = min(c["low"] for c in k15)
 
-    # ① 价格位置（8分）— 看24h反弹位置，不看15m区间
-    # 反弹0-30%=低位大机会，30-55%=良好时机，55-75%=温和，>75%=追高风险
-    if rebound_pct <= 30:
-        s += 8; reasons.append(f"24h反弹低位({rebound_pct:.0f}%)")
-    elif rebound_pct <= 55:
-        s += 6; reasons.append(f"24h反弹中部({rebound_pct:.0f}%)")
-    elif rebound_pct <= 75:
-        s += 3; reasons.append(f"24h反弹偏高({rebound_pct:.0f}%)")
-    else:
-        reasons.append(f"24h反弹高位({rebound_pct:.0f}%)-追高风险")
+    score = 0
+    reasons = []
 
-    # ② 15m短期方向（4分）
-    c15_t = (k15[-1]["close"] - k15[-3]["close"]) / k15[-3]["close"] * 100
-    if c15_t > 0:
-        s += 4; reasons.append(f"15m向上({c15_t:+.1f}%)")
+    # ========== ① 趋势强度（30分） ==========
+
+    # 15m斜率（最近4根15m）
+    c15_t = (k15[-1]["close"] - k15[-4]["close"]) / k15[-4]["close"] * 100
+    if c15_t > 2:
+        score += 10; reasons.append(f"15m强({c15_t:+.1f}%)")
+    elif c15_t > 1:
+        score += 5; reasons.append(f"15m中({c15_t:+.1f}%)")
+    elif c15_t > 0:
+        score += 2; reasons.append(f"15m弱({c15_t:+.1f}%)")
     else:
         reasons.append(f"15m向下({c15_t:+.1f}%)")
 
-    # ③ 回调止跌K线（3分）
-    last = k15[-1]
-    body = abs(last["close"] - last["open"])
-    wick = min(last["open"], last["close"]) - last["low"]
-    if body > 0 and wick > body * 2 and c15_t > 0:
-        s += 3; reasons.append("下影线止跌")
-    elif body > 0 and wick > body * 1.5 and last["close"] > last["open"]:
-        s += 2; reasons.append("小下影线")
-
-    # ④ 缩量回调（3分）
-    avg_vol = sum(c["volume"] for c in k15[-10:]) / 10
-    last_vol = last["volume"]
-    vol_r = last_vol / avg_vol if avg_vol > 0 else 1
-    if last["close"] < last["open"] and vol_r < 0.7:
-        s += 3; reasons.append(f"缩量回调({vol_r:.1f}x)")
-    elif last["close"] < last["open"] and vol_r < 1:
-        s += 1; reasons.append(f"量能正常({vol_r:.1f}x)")
-
-    # ⑤ 不创新低（3分）
-    prev3 = k15[-4:-1]
-    prev3_lo = min(c["low"] for c in prev3)
-    if last["low"] >= prev3_lo:
-        s += 3; reasons.append("不创新低")
+    # 1h斜率（最近3根1h）
+    h1h_t = (k1h[-1]["close"] - k1h[-3]["close"]) / k1h[-3]["close"] * 100
+    if h1h_t > 3:
+        score += 10; reasons.append(f"1h强({h1h_t:+.1f}%)")
+    elif h1h_t > 1:
+        score += 5; reasons.append(f"1h中({h1h_t:+.1f}%)")
+    elif h1h_t > 0:
+        score += 2; reasons.append(f"1h弱({h1h_t:+.1f}%)")
     else:
-        reasons.append("新低")
+        reasons.append(f"1h向下({h1h_t:+.1f}%)")
 
-    # ⑥ 连跌惩罚（-5分）
-    cons_down = 0
-    for c in reversed(k15[-5:]):
-        if c["close"] < c["open"]:
-            cons_down += 1
-        else:
+    # 多周期共振
+    if c15_t > 0 and h1h_t > 0:
+        score += 10; reasons.append("15m1h共振向上")
+    elif c15_t > 0 or h1h_t > 0:
+        score += 5; reasons.append("单周期向上")
+
+    # ========== ② 动能健康度（30分） ==========
+
+    recent = k15[-5:]
+    # 量价配合
+    vol_up = sum(c["volume"] for c in recent if c["close"] >= c["open"])
+    vol_dn = sum(c["volume"] for c in recent if c["close"] < c["open"])
+    if vol_up > vol_dn * 2:
+        score += 10; reasons.append("上涨放量")
+    elif vol_up > vol_dn:
+        score += 5; reasons.append("量价健康")
+    else:
+        score -= 5; reasons.append("下跌放量")
+
+    # 见顶信号（长上影线）
+    has_upper_wick = False
+    for c in k15[-3:]:
+        body = abs(c["close"] - c["open"])
+        upper_wick = c["high"] - max(c["open"], c["close"])
+        if body > 0 and upper_wick > body * 1.5:
+            has_upper_wick = True
             break
-    if cons_down >= 3:
-        s -= 5; reasons.append(f"连{cons_down}阴-惩罚")
+    if not has_upper_wick:
+        score += 10; reasons.append("无见顶信号")
+    else:
+        score -= 5; reasons.append("有上影线")
 
-    # ⑦ 放量下跌惩罚（-5分）
-    if last["close"] < last["open"] and vol_r > 1.5:
-        s -= 5; reasons.append("放量下跌-惩罚")
+    # 买盘优势
+    up_count = sum(1 for c in recent if c["close"] >= c["open"])
+    dn_count = sum(1 for c in recent if c["close"] < c["open"])
+    if up_count >= 4:
+        score += 10; reasons.append(f"买盘优势({up_count}阳{dn_count}阴)")
+    elif up_count >= 3:
+        score += 5; reasons.append(f"买盘略优({up_count}阳)")
 
-    s = max(0, min(20, s))
+    # ========== ③ 上涨空间（40分） ==========
 
-    # 根据K线数据计算价格区间和压力位
-    # 支撑位：20根15m最低点 + 最近5根15m的最低点（取更高 = 更近的支撑）
-    k5_low = min(c["low"] for c in k15[-5:])
-    support_price = max(lo, k5_low)
-    entry_low = round(min(price, support_price * 1.01), 6)
+    # 离24h最高点距离
+    space_to_high = (high_24h - price) / price * 100 if price > 0 else 0
+    if space_to_high > 15:
+        score += 20; reasons.append(f"空间{space_to_high:.0f}%->宽裕")
+    elif space_to_high > 10:
+        score += 15; reasons.append(f"空间{space_to_high:.0f}%->良好")
+    elif space_to_high > 5:
+        score += 10; reasons.append(f"空间{space_to_high:.0f}%->中等")
+    elif space_to_high > 3:
+        score += 5; reasons.append(f"空间{space_to_high:.0f}%->偏小")
+    else:
+        reasons.append(f"空间{space_to_high:.0f}%->见顶风险")
+
+    # 近端压力位（15m周期最高点）
+    d2_r = (high_15m - price) / price * 100 if price > 0 else 0
+    if d2_r > 5:
+        score += 10; reasons.append(f"压力位远({d2_r:.1f}%)")
+    elif d2_r > 2:
+        score += 5; reasons.append(f"压力位中({d2_r:.1f}%)")
+    elif d2_r > 0:
+        reasons.append(f"近压力位({d2_r:.1f}%)")
+
+    # 下方有支撑（近3根15m低点就在附近，说明没破位）
+    recent_low = min(c["low"] for c in k15[-3:])
+    d2_support = (price - recent_low) / price * 100 if price > 0 else 0
+    if d2_support < 2:
+        score += 10; reasons.append(f"近支撑({d2_support:.1f}%)")
+
+    # 计算开仓区间和压力位（给后续逻辑用）
+    entry_low = round(min(price, recent_low * 1.01), 6)
     entry_high = round(price, 6)
+    near_resist = round(high_15m, 6)
+    far_resist = round(high_24h, 6)
 
-    # 近端压力位：最近5根15m最高点（最近的阻力）
-    k5_high = max(c["high"] for c in k15[-5:])
-    near_resist = round(min(hi, k5_high), 6)
-
-    # 远端压力位：20根15m最高点（大周期阻力）
-    far_resist = round(hi, 6)
-
-    return s, "; ".join(reasons), (entry_low, entry_high), near_resist, far_resist
+    return score, "; ".join(reasons), (entry_low, entry_high), near_resist, far_resist
 
 
 def place_new_trade(signals=None):
@@ -514,7 +523,7 @@ def place_new_trade(signals=None):
     for best in signals[:20]:
         if best["symbol"] in existing: continue
         timing, timing_reason, entry_range, near_resist, far_resist = entry_timing(best["symbol"])
-        if timing < 10:
+        if timing < 40:
             continue
         entries.append({"symbol": best["symbol"], "price": best["price"],
                         "change": best["change"], "fundingRate": best["fundingRate"],
@@ -528,10 +537,8 @@ def place_new_trade(signals=None):
         price = best["price"]
         timing = best["score"]
 
-        if timing >= 16:
+        if timing >= 60:
             leverage = 10; target_value = 95
-        elif timing >= 13:
-            leverage = 8; target_value = 75
         else:
             leverage = 5; target_value = 55
 
