@@ -10,7 +10,7 @@ from datetime import datetime
 from collections import Counter
 
 PROXY = "socks5://127.0.0.1:7891"
-CURLE = ["curl", "-s", "--max-time", "10", "--socks5-hostname", "127.0.0.1:7891"]
+CURLE = ["curl", "-s", "--connect-timeout", "5", "--max-time", "10", "--socks5-hostname", "127.0.0.1:7891"]
 
 def get_api_keys():
     with open(os.path.expanduser("~/.binance/trading")) as f:
@@ -113,6 +113,20 @@ def analyze_position(symbol, entry_price, amt):
         if k4h_pos and len(k4h_pos) >= 2:
             h4h_t = (k4h_pos[-1]["close"] - k4h_pos[-2]["close"]) / k4h_pos[-2]["close"] * 100 if k4h_pos[-2]["close"] else 0
         big_trend = h1h_t + h4h_t
+
+        # 大周期持续下跌防守：1h连续阴线≥6根（6小时持续下跌），直接止损
+        # 防止缩量健康回调的误判，保护在加速下跌行情中
+        if k1h and len(k1h) >= 8:
+            cons_1h_down = 0
+            for c in reversed(k1h[-8:]):
+                if c["close"] < c["open"]:
+                    cons_1h_down += 1
+                else:
+                    break
+            if cons_1h_down >= 6:
+                scores["sl"] += 25; rsl.append(f"1h连{cons_1h_down}阴-趋势加速下跌")
+            elif cons_1h_down >= 4:
+                scores["sl"] += 12; rsl.append(f"1h连{cons_1h_down}阴-持续弱势")
 
         # 压力位判断：用15m K线看近端压力和冲击次数
         k15_h26 = sorted([c["high"] for c in k15], reverse=True)
@@ -288,7 +302,8 @@ def analyze_position(symbol, entry_price, amt):
             tp_reason += f" 近端压力{near_resist:.4f}"
 
         # ⑦ 压力位冲击判断 — 价格到压力位多次冲不破，考虑止盈
-        if resist_stuck:
+        # 但如果大周期趋势很强（1h+4h向上），不因为短期压力位阻挡就平仓
+        if resist_stuck and big_trend <= 0:
             scores["tp"] += 12; rtp.append(f"压力{near_resist:.4f}冲击{touches}次未破")
 
     # 决策
@@ -297,7 +312,7 @@ def analyze_position(symbol, entry_price, amt):
     max_ = max(scores["tp"], scores["hold"], scores["sl"])
     if max_ == 0: action, reason, conf = "hold", f"趋势平稳({pnl_pct:+.1f}%)", 0.5
     elif scores["tp"] == max_ and scores["tp"] > scores["hold"]: action, reason, conf = "tp", "; ".join(rtp[:2]), min(0.5+max_/60,0.95)
-    elif scores["sl"] == max_ and scores["sl"] > scores["hold"]: action, reason, conf = "sl", "; ".join(rsl[:2]), min(0.5+max_/40,0.95)
+    elif scores["sl"] == max_ and scores["sl"] >= scores["hold"]: action, reason, conf = "sl", "; ".join(rsl[:2]), min(0.5+max_/40,0.95)
     else: action, reason, conf = "hold", "; ".join(rhd[:2]) if rhd else f"趋势健康({pnl_pct:+.1f}%)", min(0.5+max_/50,0.85)
     report = {**scores, "pnl_pct": round(pnl_pct,2), "pullback_24h": round(pullback,1), "chg_24h": round(chg_24h,1), "fr": round(fr,3)}
     return (action, reason, round(conf,2), report)
