@@ -107,22 +107,102 @@ def analyze_position(symbol, entry_price, amt):
         c15_t = (k15[-1]["close"]-k15[-4]["close"])/k15[-4]["close"]*100 if k15[-4]["close"] else 0
         h1h_t = (k1h[-1]["close"]-k1h[-4]["close"])/k1h[-4]["close"]*100 if k1h[-4]["close"] else 0
 
+        # 大周期趋势判断
+        k4h_pos = get_klines(symbol, "4h", 3)
+        h4h_t = 0
+        if k4h_pos and len(k4h_pos) >= 2:
+            h4h_t = (k4h_pos[-1]["close"] - k4h_pos[-2]["close"]) / k4h_pos[-2]["close"] * 100 if k4h_pos[-2]["close"] else 0
+        big_trend = h1h_t + h4h_t
+
+        # 压力位判断：用15m K线看近端压力和冲击次数
+        k15_h26 = sorted([c["high"] for c in k15], reverse=True)
+        near_resist = k15_h26[0] if len(k15_h26) > 0 else mark  # 15m周期最高点
+        # 看价格是否在压力位附近（2%以内）
+        d2_resist = (near_resist - mark) / mark * 100 if mark > 0 else 999
+        # 看最近12根15m有多少根的高点接近当前压力位（冲击次数）
+        touches = sum(1 for c in k15 if abs(c["high"] - near_resist) / near_resist < 0.01)
+        # 如果多次冲击压力位不破，且价格在压力位附近，考虑止盈
+        resist_stuck = d2_resist < 2 and touches >= 2 and c15_t <= 0
+
+        # K线级别的回调判断指标（不依赖硬数值）：
+        # 下影线 = 有买盘承接，回调健康
+        # 量比 = 缩量回调健康，放量下跌危险
+        # 支撑位距离 = 接近前低/均线可能有支撑
+        # 连续阴线数 = 连跌过多趋势可能走坏
+        # 以下在每个打分项中直接用这些指标判断，不设硬阈值
+
         # ① 趋势
         up = sum(1 for v in [c5_t, c15_t, h1h_t] if v > 0)
         dn = sum(1 for v in [c5_t, c15_t, h1h_t] if v < 0)
         if up >= 2: scores["hold"] += 12; rhd.append(f"共振向上({c5_t:+.1f}%/{c15_t:+.1f}%/{h1h_t:+.1f}%)")
-        elif dn >= 2: scores["tp"] += 8; rtp.append(f"共振向下({c5_t:+.1f}%/{c15_t:+.1f}%/{h1h_t:+.1f}%)")
+        elif dn >= 2:
+            # 共振向下的情况下，用K线特征判断是回调还是走坏
+            # 看15m最后K线有没有下影线（买盘承接）
+            last15 = k15[-1]
+            body15 = abs(last15["close"] - last15["open"])
+            wick15 = min(last15["open"], last15["close"]) - last15["low"]
+            has_lower_wick = body15 > 0 and wick15 > body15 * 1.2
+
+            # 看是否缩量（量比<1）
+            lv = k15[-1]["volume"]
+            av = sum(c["volume"] for c in k15) / len(k15)
+            vol_shrink = lv < av
+
+            # 看是否接近15m支撑位
+            k15_lows = sorted(c["low"] for c in k15)
+            recent_low = k15_lows[0] if k15_lows else 0
+            d2_support = (mark - recent_low) / mark * 100 if mark > 0 else 999
+
+            # 看大周期是否还在向上
+            big_ok = big_trend > 0
+
+            # 正常回调特征：有下影线 + 缩量 + 近支撑 + 大周期向上
+            pullback_signals = sum([has_lower_wick, vol_shrink, d2_support < 3, big_ok])
+            if pullback_signals >= 3:
+                scores["hold"] += 6
+                reasons_dn = []
+                if has_lower_wick: reasons_dn.append("下影线")
+                if vol_shrink: reasons_dn.append("缩量")
+                if d2_support < 3: reasons_dn.append(f"近支撑({d2_support:.1f}%)")
+                if big_ok: reasons_dn.append(f"大周期{big_trend:+.1f}%")
+                rhd.append("回调(" + "+".join(reasons_dn) + ")")
+            elif pullback_signals >= 2:
+                scores["hold"] += 3
+                rhd.append("偏弱观望")
+            else:
+                scores["tp"] += 10; rtp.append(f"趋势走弱({c5_t:+.1f}%/{c15_t:+.1f}%/{h1h_t:+.1f}%)")
         if len(k15) >= 4:
             rg = [(k15[i]["high"]-k15[i]["low"])/k15[i]["low"]*100 for i in range(-4,-1)]
-            if rg[-1] < rg[-2]*0.6: scores["hold" if h1h_t>0 else "tp"] += 5; (rhd if h1h_t>0 else rtp).append("波幅收敛")
-            elif rg[-1] > rg[-2]*1.8: scores["hold" if c15_t>0 else "tp"] += 6; (rhd if c15_t>0 else rtp).append("波幅扩张")
+            if rg[-1] < rg[-2]*0.6:
+                scores["hold"] += 5; rhd.append("波幅收敛")
+            elif rg[-1] > rg[-2]*1.8:
+                # 波幅扩张：看方向特征
+                last15 = k15[-1]
+                body15 = abs(last15["close"] - last15["open"])
+                wick15 = min(last15["open"], last15["close"]) - last15["low"]
+                has_lower_wick = body15 > 0 and wick15 > body15 * 1.2
+                if c15_t > 0:
+                    scores["hold"] += 6; rhd.append("波幅扩张(上涨)")
+                elif big_trend > 0 and has_lower_wick:
+                    scores["hold"] += 3; rhd.append("波幅扩张(下影线支撑)")
+                else:
+                    scores["tp"] += 6; rtp.append("波幅扩张(下跌)")
 
         # ② 量价
         bv = [c["volume"] for c in k5[-8:] if c["close"] < c["open"]]
         lv = [c["volume"] for c in k5[-8:] if c["close"] >= c["open"]]
         ab = sum(bv)/len(bv) if bv else 0; al = sum(lv)/len(lv) if lv else ab
         bbr = (ab/al) if (ab and al) else 1.0
-        if bbr > 1.5 and c15_t < 0: scores["tp"] += 10; rtp.append(f"卖盘{bbr:.1f}倍买盘")
+        if bbr > 1.5 and c15_t < 0:
+            # 卖盘放量但大周期向上时看K线特征
+            last15 = k15[-1]
+            body15 = abs(last15["close"] - last15["open"])
+            wick15 = min(last15["open"], last15["close"]) - last15["low"]
+            has_lower_wick = body15 > 0 and wick15 > body15 * 1.2
+            if big_trend > 0 and has_lower_wick:
+                scores["hold"] += 3; rhd.append(f"卖盘{bbr:.1f}倍(有下影线承接)")
+            else:
+                scores["tp"] += 10; rtp.append(f"卖盘{bbr:.1f}倍买盘")
         elif bbr < 0.7 and c15_t > 0: scores["hold"] += 8; rhd.append(f"买盘{1/bbr:.1f}倍卖盘")
         l3v = [c["volume"] for c in k5[-3:]]; l3c = [c["close"] for c in k5[-3:]]
         vu, pu = l3v[-1]>l3v[0], l3c[-1]>l3c[0]
@@ -180,43 +260,46 @@ def analyze_position(symbol, entry_price, amt):
         # ⑥ 市场情绪
         if fr < -0.5: scores["hold"] += 6; rhd.append(f"负费率{fr:.3f}%")
         elif fr > 0.1: scores["tp"] += 4; rtp.append(f"正费率{fr:.3f}%")
-        if 3 <= pullback <= 8 and chg_24h > 10: scores["hold"] += 4; rhd.append("健康回调")
 
-    # 决策前计算动态止盈目标价
+    # 决策前计算动态止盈目标价（基于趋势强度 + 压力位）
     tp_target = None
     tp_reason = ""
     if k15 and k1h:
-        # 基于15m/1h趋势给目标价
         c15_up = (k15[-1]["close"] - k15[-4]["close"]) / k15[-4]["close"] * 100 if k15[-4]["close"] else 0
         h1h_up = (k1h[-1]["close"] - k1h[-4]["close"]) / k1h[-4]["close"] * 100 if k1h[-4]["close"] else 0
-        # 趋势强度 = 平均每分钟涨幅
         if c15_up > 0 and h1h_up > 0:
-            # 趋势强 = 15m斜率大
             trend_strength = max(c15_up, h1h_up)
-            # 合理止盈目标：趋势强给高目标
             if trend_strength > 8:
-                tp_pct = 10  # 强趋势，看10%
+                tp_pct = 10
             elif trend_strength > 4:
-                tp_pct = 7   # 中趋势，看7%
+                tp_pct = 7
             else:
-                tp_pct = 5   # 弱趋势，看5%
-            # 但已有盈利+趋势强度不能太激进
+                tp_pct = 5
             if pnl_pct > 0:
-                extra = min(trend_strength * 0.5, 5)  # 趋势每1%约0.5%额外空间
+                extra = min(trend_strength * 0.5, 5)
                 tp_pct = tp_pct + extra
-            tp_pct = min(tp_pct, 15)  # 上限15%
+            tp_pct = min(tp_pct, 15)
             tp_target = round(entry_price * (1 + tp_pct / 100), 8)
-            tp_reason = f"目标{tp_pct}%(${tp_target:.5f})"
-            scores["tp"] += 3  # 有明确目标加点基础分
+            tp_reason = f"趋势目标{tp_pct}%(${tp_target:.5f})"
+            scores["tp"] += 3
+        # 压力位作为附加参考：如果趋势目标超过了压力位，以压力位为参考
+        if tp_target and near_resist and tp_target > near_resist:
+            tp_target = near_resist
+            tp_reason += f" 近端压力{near_resist:.4f}"
+
+        # ⑦ 压力位冲击判断 — 价格到压力位多次冲不破，考虑止盈
+        if resist_stuck:
+            scores["tp"] += 12; rtp.append(f"压力{near_resist:.4f}冲击{touches}次未破")
+
     # 决策
     if pnl_pct <= -7:
-        return ("sl", f"亏损{pnl_pct:.2f}%触发止损", 1.0, {"tp":0,"hold":0,"sl":0,"pnl_pct":round(pnl_pct,2),"pullback_24h":round(pullback,1),"chg_24h":round(chg_24h,1),"fr":round(fr,3),"tp_target":tp_target,"tp_reason":tp_reason})
+        return ("sl", f"亏损{pnl_pct:.2f}%触发止损", 1.0, {"tp":0,"hold":0,"sl":0,"pnl_pct":round(pnl_pct,2),"pullback_24h":round(pullback,1),"chg_24h":round(chg_24h,1),"fr":round(fr,3)})
     max_ = max(scores["tp"], scores["hold"], scores["sl"])
     if max_ == 0: action, reason, conf = "hold", f"趋势平稳({pnl_pct:+.1f}%)", 0.5
     elif scores["tp"] == max_ and scores["tp"] > scores["hold"]: action, reason, conf = "tp", "; ".join(rtp[:2]), min(0.5+max_/60,0.95)
     elif scores["sl"] == max_ and scores["sl"] > scores["hold"]: action, reason, conf = "sl", "; ".join(rsl[:2]), min(0.5+max_/40,0.95)
     else: action, reason, conf = "hold", "; ".join(rhd[:2]) if rhd else f"趋势健康({pnl_pct:+.1f}%)", min(0.5+max_/50,0.85)
-    report = {**scores, "pnl_pct": round(pnl_pct,2), "pullback_24h": round(pullback,1), "chg_24h": round(chg_24h,1), "fr": round(fr,3), "tp_target": tp_target, "tp_reason": tp_reason}
+    report = {**scores, "pnl_pct": round(pnl_pct,2), "pullback_24h": round(pullback,1), "chg_24h": round(chg_24h,1), "fr": round(fr,3)}
     return (action, reason, round(conf,2), report)
 
 def close_position(symbol, side, amt):
@@ -245,69 +328,69 @@ def scan_market():
         if chg < 8 or chg > 60 or vol < 500000: continue
         fr = fr_map.get(sym, 0)
         pb = (float(t['highPrice']) - price) / float(t['highPrice']) * 100 if float(t['highPrice']) > 0 else 0
-        score = (abs(fr)*3 if fr < 0 else 0) + (pb if 3 <= pb <= 15 else 0) + (10 if 10 <= chg <= 40 else 0) + min(vol/10000000, 5)
-        candidates.append({"symbol": sym, "price": price, "change": chg, "volume": vol, "fundingRate": fr*100, "pullback": pb, "score": round(score,1), "base_score": score})
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+        candidates.append({"symbol": sym, "price": price, "change": chg, "volume": vol, "fundingRate": fr*100, "pullback": pb, "score": 0})
 
-    # 对前15名做K线趋势评分加成
-    for c in candidates[:15]:
+    # 取涨幅前40名，用潜力指标评分（不是看已经涨了多少）
+    for c in candidates[:40]:
         k15 = get_klines(c["symbol"], "15m", 4)
         k1h = get_klines(c["symbol"], "1h", 5)
         k4h = get_klines(c["symbol"], "4h", 3)
 
-        c["score"] = 0  # 重置，以K线趋势为主重新打分
+        score = 0
+        reasons = []
 
-        # 原静态基础分（权重30%）
-        base = c["base_score"]
+        # ① 资金费率（最大20分）— 空头挤压潜力，独立于价格位置
+        fr = c["fundingRate"]
+        if fr < -0.1:
+            score += 20; reasons.append(f"费率{fr:.2f}%-强烈空头挤压")
+        elif fr < -0.05:
+            score += 15; reasons.append(f"费率{fr:.2f}%-空头挤压")
+        elif fr < -0.01:
+            score += 10; reasons.append(f"费率{fr:.2f}%-轻度空头")
+        elif fr < 0:
+            score += 5; reasons.append(f"费率{fr:.2f}%-微负")
 
-        # 15分钟趋势（权重20%）
-        trend_15 = 0
+        # ② 成交量爆发（最高15分）— 看最近1h量对比前几小时是否放量，资金刚进场
+        if k1h and len(k1h) >= 4:
+            last_vol = k1h[-1]["volume"]
+            prev_vols = sum(k["volume"] for k in k1h[-4:-1]) / 3
+            vol_surge = last_vol / prev_vols if prev_vols > 0 else 1
+            if vol_surge > 3:
+                score += 15; reasons.append(f"放量{vol_surge:.1f}x-资金爆发")
+            elif vol_surge > 2:
+                score += 10; reasons.append(f"放量{vol_surge:.1f}x-资金进场")
+            elif vol_surge > 1.5:
+                score += 5; reasons.append(f"放量{vol_surge:.1f}x-量能放大")
+
+        # ③ 多周期共振刚刚形成（最高15分）— 15m和1h刚刚同时翻多，不是已经涨了很久
+        c15_t = 0
+        h1h_t = 0
+        h4h_t = 0
         if k15 and len(k15) >= 3:
             c15_t = (k15[-1]["close"] - k15[-3]["close"]) / k15[-3]["close"] * 100
-            trend_15 = c15_t * 2  # 1%趋势=2分
-            # 15分钟最后K线量能验证
-            last = k15[-1]
-            body = last["close"] - last["open"]
-            avg_vol = sum(k["volume"] for k in k15) / len(k15)
-            vol_r = last["volume"] / avg_vol if avg_vol > 0 else 1
-            if body > 0 and vol_r > 1.3: trend_15 += 4
-            elif body < 0 and vol_r > 1.3: trend_15 -= 4
-            # 连续阳线加分
-            cons_up = sum(1 for k in k15[-3:] if k["close"] > k["open"])
-            if cons_up >= 2: trend_15 += 3
-            elif cons_up <= 1: trend_15 -= 2
-
-        # 1小时趋势（权重30%）
-        trend_1h = 0
         if k1h and len(k1h) >= 3:
-            c1h_short = (k1h[-1]["close"] - k1h[-3]["close"]) / k1h[-3]["close"] * 100
-            c1h_long = (k1h[-1]["close"] - k1h[-4]["close"]) / k1h[-4]["close"] * 100
-            trend_1h = (c1h_short * 3 + c1h_long * 2) / 2  # 短周期权重更高
-            # 1小时放量验证
-            last = k1h[-1]
-            body = last["close"] - last["open"]
-            avg_vol = sum(k["volume"] for k in k1h) / len(k1h)
-            vol_r = last["volume"] / avg_vol if avg_vol > 0 else 1
-            if body > 0 and vol_r > 1.3: trend_1h += 5
-            elif body < 0 and vol_r > 1.3: trend_1h -= 5
-            # 趋势方向一致性
-            cons_down = sum(1 for k in k1h[-4:] if k["close"] < k["open"])
-            if cons_down >= 3: trend_1h -= 4
-
-        # 4小时趋势（权重20%）
-        trend_4h = 0
+            h1h_t = (k1h[-1]["close"] - k1h[-3]["close"]) / k1h[-3]["close"] * 100
         if k4h and len(k4h) >= 2:
-            c4h_t = (k4h[-1]["close"] - k4h[-2]["close"]) / k4h[-2]["close"] * 100
-            trend_4h = c4h_t * 3
-            # 4小时放量
-            last = k4h[-1]
-            body = last["close"] - last["open"]
-            avg_vol = sum(k["volume"] for k in k4h) / len(k4h) if len(k4h) > 1 else last["volume"]
-            vol_r = last["volume"] / avg_vol if avg_vol > 0 else 1
-            if body > 0 and vol_r > 1.3: trend_4h += 6
-            elif body < 0 and vol_r > 1.3: trend_4h -= 6
+            h4h_t = (k4h[-1]["close"] - k4h[-2]["close"]) / k4h[-2]["close"] * 100
 
-        c["score"] = round(base * 0.3 + trend_15 + trend_1h + trend_4h, 1)
+        # 刚共振：短时间内多周期同时翻多（表示趋势刚开始）
+        if c15_t > 0 and h1h_t > 0:
+            score += 10; reasons.append(f"15m1h共振向上")
+            if h4h_t > 0:
+                score += 5; reasons.append("4h也向上-全周期共振")
+        elif c15_t > 0 or h1h_t > 0:
+            score += 3; reasons.append("单周期向上")
+
+        # ④ 24h涨幅（最高10分）— 基础动能，但不给太高权重
+        chg = c["change"]
+        if 8 <= chg <= 20:
+            score += 10; reasons.append(f"涨幅{chg:.0f}%-启动区")
+        elif 20 < chg <= 30:
+            score += 5; reasons.append(f"涨幅{chg:.0f}%-拉升中")
+        elif 30 < chg <= 60:
+            score += 2; reasons.append(f"涨幅{chg:.0f}%-高位")
+
+        c["score"] = round(score, 1)
         signals.append(c)
     signals.sort(key=lambda x: x["score"], reverse=True)
     return signals[:30]
@@ -331,9 +414,9 @@ def format_status_header(balances, positions):
 
 def entry_timing(symbol):
     """
-    入场时机评分（0~20分）：
+    入场时机评分（0~20分）：判断价格位置是否适合进场
     - 价格在区间低位 +8
-    - 15m趋势向上 +4
+    - 15m短期向上 +4
     - 回调止跌信号 +3
     - 回调缩量 +3
     - 不创新低 +3
@@ -360,7 +443,7 @@ def entry_timing(symbol):
     else:
         reasons.append(f"高位({pos_pct:.0f}%)-追高风险")
 
-    # ② 15m短期趋势（4分）
+    # ② 15m短期方向（4分）
     c15_t = (k15[-1]["close"] - k15[-3]["close"]) / k15[-3]["close"] * 100
     if c15_t > 0:
         s += 4; reasons.append(f"15m向上({c15_t:+.1f}%)")
@@ -408,7 +491,22 @@ def entry_timing(symbol):
         s -= 5; reasons.append("放量下跌-惩罚")
 
     s = max(0, min(20, s))
-    return s, "; ".join(reasons)
+
+    # 根据K线数据计算价格区间和压力位
+    # 支撑位：20根15m最低点 + 最近5根15m的最低点（取更高 = 更近的支撑）
+    k5_low = min(c["low"] for c in k15[-5:])
+    support_price = max(lo, k5_low)
+    entry_low = round(min(price, support_price * 1.01), 6)
+    entry_high = round(price, 6)
+
+    # 近端压力位：最近5根15m最高点（最近的阻力）
+    k5_high = max(c["high"] for c in k15[-5:])
+    near_resist = round(min(hi, k5_high), 6)
+
+    # 远端压力位：20根15m最高点（大周期阻力）
+    far_resist = round(hi, 6)
+
+    return s, "; ".join(reasons), (entry_low, entry_high), (near_resist, far_resist)
 
 
 def place_new_trade(signals=None):
@@ -425,14 +523,23 @@ def place_new_trade(signals=None):
     # 遍历前15名，跳过已有持仓的币
     for best in signals[:15]:
         if best["symbol"] in existing: continue
-        if best["score"] < 6: continue
+        if best["score"] < 12: continue  # 门槛从6→12，过滤掉低质量信号减少亏损
         score = best["score"]
         price = best["price"]
 
         # 入场时机检查
-        timing, timing_reason = entry_timing(best["symbol"])
+        timing, timing_reason, entry_range, tp_target = entry_timing(best["symbol"])
         if timing < 10:
             continue  # 入场时机不佳，跳过等下次
+        
+        # 入场位置过高（>70%区间高位）直接禁止开仓 — 追高是亏损第一原因
+        if "高位" in timing_reason and timing_reason.startswith("高位"):
+            h_pct = 0
+            import re as _re_high
+            hm = _re_high.search(r'(\d+)%', timing_reason)
+            if hm: h_pct = int(hm.group(1))
+            if h_pct >= 70:
+                continue
 
         if score >= 20:
             leverage = 10; target_value = 95
@@ -451,7 +558,8 @@ def place_new_trade(signals=None):
         r = place_order(best["symbol"], "BUY", "LONG", qty, leverage)
         if "orderId" in r:
             return {"symbol": best["symbol"], "qty": qty, "price": price, "value": round(qty*price, 1),
-                    "leverage": leverage, "reason": f"评分{score} 入场时机{timing}({timing_reason}) 涨幅{best['change']:.1f}% 费率{best['fundingRate']:+.4f}% 回调{best['pullback']:.1f}%"}
+                    "leverage": leverage, "reason": f"评分{score} 入场时机{timing}({timing_reason}) 涨幅{best['change']:.1f}% 费率{best['fundingRate']:+.4f}%",
+                    "entry_range": entry_range, "tp_target": tp_target}
     return None
 
 def load_tracker():
@@ -470,10 +578,63 @@ def save_tracker(tracker):
     f = os.path.expanduser("~/.hermes/scripts/tracker.json")
     with open(f, "w") as fp: json.dump(tracker, fp)
 
+def check_btc_market():
+    """判断BTC大盘环境，返回(状态, 描述, 操作系数, BTC价格)
+    三档：向下→不开仓  横盘→正常  向上→积极
+    用15m+1h+4h+24h四个维度综合判断
+    """
+    t = curl_get("https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=BTCUSDT")
+    if not t: return "unknown", "BTC数据获取失败", 1.0, 0
+    btc_chg = float(t['priceChangePercent'])
+    btc_price = float(t['lastPrice'])
+
+    # 15m趋势
+    k15 = get_klines("BTCUSDT", "15m", 4)
+    btc_15m = 0
+    if k15 and len(k15) >= 3:
+        btc_15m = (k15[-1]["close"] - k15[-3]["close"]) / k15[-3]["close"] * 100
+
+    # 1h趋势
+    k1h = get_klines("BTCUSDT", "1h", 4)
+    btc_1h = 0
+    if k1h and len(k1h) >= 3:
+        btc_1h = (k1h[-1]["close"] - k1h[-3]["close"]) / k1h[-3]["close"] * 100
+
+    # 4h趋势
+    k4h = get_klines("BTCUSDT", "4h", 3)
+    btc_4h = 0
+    if k4h and len(k4h) >= 2:
+        btc_4h = (k4h[-1]["close"] - k4h[-2]["close"]) / k4h[-2]["close"] * 100
+
+    # 看四个维度中涨的多还是跌的多
+    up = sum(1 for v in [btc_15m, btc_1h, btc_4h, btc_chg] if v > 0)
+    down = sum(1 for v in [btc_15m, btc_1h, btc_4h, btc_chg] if v < 0)
+
+    # 极端下跌（24h跌超3%且多周期向下）
+    if btc_chg < -3 and down >= 3:
+        return "danger", f"📉 BTC全周期下跌(24h{btc_chg:.1f}% 1h{btc_1h:+.1f}%), 不开新仓", 0.0, btc_price
+
+    # 趋势向下（多周期跌多涨少）
+    if down >= 3:
+        return "down", f"📉 BTC偏弱(15m{btc_15m:+.1f}% 1h{btc_1h:+.1f}% 4h{btc_4h:+.1f}%), 不开新仓", 0.0, btc_price
+
+    # 趋势向上（多周期涨多跌少或全涨）
+    if up >= 3 or (btc_chg > 1 and up >= 2):
+        return "up", f"📈 BTC向好(24h{btc_chg:+.1f}% 1h{btc_1h:+.1f}% 4h{btc_4h:+.1f}%), 正常操作", 1.0, btc_price
+
+    # 横盘分化
+    return "sideways", f"➡️ BTC横盘(24h{btc_chg:+.1f}% 1h{btc_1h:+.1f}%), 正常操作", 1.0, btc_price
+
+
 def main():
     msg = []
     balances, positions = get_account()
     if balances is None: print("⚠️ API连接失败"); return
+
+    # BTC大盘环境判断
+    btc_status, btc_desc, btc_coeff, btc_price = check_btc_market()
+    msg.append(f"🟡 BTC: ${btc_price:.0f} {btc_desc}")
+
     signals = scan_market()
     tracker = load_tracker()
     pos_map = {p["symbol"]: p for p in positions} if positions else {}
@@ -521,16 +682,8 @@ def main():
                     save_tracker(tracker)
                     continue
 
-            # ③ 固定止盈：盈利≥8%直接止盈
-            if pnl_pct >= 8 and not tr.get("tp_triggered"):
-                r = close_position(p["symbol"], p["side"], p["amt"])
-                if "orderId" in r:
-                    msg.append(f"💰 固定止盈! {sym} 盈利{pnl_pct:.2f}% 到达8%目标")
-                    tr["tp_triggered"] = True
-                    tracker.pop(sym, None)
-                else: msg.append(f"⚠️ {sym} 止盈失败: {r.get('msg','?')}")
-                save_tracker(tracker)
-                continue
+            # ③ 固定止盈移除 — 完全由评分系统动态判断止盈
+            # 只有硬止损保留：-7%硬止损
 
     save_tracker(tracker)
     # 智能评分
@@ -541,14 +694,20 @@ def main():
             if sym not in tracker: continue
             action, reason, conf, rpt = analyze_position(p["symbol"], p["entry"], p["amt"])
             e = "🟢" if rpt.get("pnl_pct", 0) > 0 else "🔴"
-            if action == "tp":
+            if action == "tp" or action == "sl":
+                if action == "tp" and rpt.get("pnl_pct", 0) < 0:
+                    label = "止损(趋势走弱)"
+                elif action == "tp":
+                    label = "止盈"
+                else:
+                    label = "止损"
                 r = close_position(p["symbol"], p["side"], p["amt"])
-                if "orderId" in r: msg.append(f"💰 止盈! {p['symbol']} ⭐{rpt['tp']}/{rpt['hold']}/{rpt['sl']} {reason}")
-                else: msg.append(f"⚠️ {p['symbol']} 止盈失败: {r.get('msg','?')}")
-            elif action == "sl":
-                r = close_position(p["symbol"], p["side"], p["amt"])
-                if "orderId" in r: msg.append(f"🛑 止损! {p['symbol']} ⭐{rpt['tp']}/{rpt['hold']}/{rpt['sl']} {reason}")
-                else: msg.append(f"⚠️ {p['symbol']} 止损失败: {r.get('msg','?')}")
+                if "orderId" in r:
+                    msg.append(f"💰 {label}! {p['symbol']} ⭐{rpt['tp']}/{rpt['hold']}/{rpt['sl']} {reason}")
+                    tracker.pop(sym, None)
+                    save_tracker(tracker)
+                else:
+                    msg.append(f"⚠️ {p['symbol']} 平仓失败: {r.get('msg','?')}")
             else:
                 tp_s = rpt.get('tp', 0)
                 hd_s = rpt.get('hold', 0)
@@ -560,9 +719,14 @@ def main():
                 else: verdict = "建议关注 ❌"
                 msg.append(f"{e} {p['symbol']} {rpt['pnl_pct']:+.2f}% 📊综合{composite}分 {verdict} | {reason}")
     cnt = len(positions) if positions else 0
-    if cnt < 4 and signals and signals[0]["score"] >= 6:
+    # BTC向下时不开新仓，向上或横盘时正常开
+    if btc_coeff > 0 and cnt < 4 and signals and signals[0]["score"] >= 12:
         t = place_new_trade(signals)
-        if t: msg.append(f"🚀 新开仓! {t['symbol']} {t['qty']}张 {t['leverage']}x 价值${t['value']} @${t['price']:.4f} ({t['reason']})")
+        if t: 
+            er = t.get('entry_range', (0,0))
+            nr, fr = t.get('tp_target', (0,0))
+            msg.append(f"🚀 新开仓! {t['symbol']} {t['qty']}张 {t['leverage']}x 价值${t['value']} @${t['price']:.4f} ({t['reason']})")
+            msg.append(f"   📊 区间: ${er[0]:.4f}~${er[1]:.4f} 🔴压力: ${nr:.4f}→${fr:.4f}")
     print(format_status_header(balances, positions))
     if msg:
         print("\n--- 动作 ---")
