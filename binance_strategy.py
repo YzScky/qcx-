@@ -275,12 +275,36 @@ def analyze_position(symbol, entry_price, amt):
         if fr < -0.5: scores["hold"] += 6; rhd.append(f"负费率{fr:.3f}%")
         elif fr > 0.1: scores["tp"] += 4; rtp.append(f"正费率{fr:.3f}%")
 
-    # 决策前计算动态止盈目标价（基于趋势强度 + 压力位）
+    # 决策前计算动态止盈目标价（基于入场评分 + 趋势 + 压力位）
     tp_target = None
     tp_reason = ""
+    # 根据tracker中的入场评分调整止盈策略
+    trk = load_tracker()
+    tr_entry = trk.get(symbol, {}).get("entry_score", 50)
     if k15 and k1h:
         c15_up = (k15[-1]["close"] - k15[-4]["close"]) / k15[-4]["close"] * 100 if k15[-4]["close"] else 0
         h1h_up = (k1h[-1]["close"] - k1h[-4]["close"]) / k1h[-4]["close"] * 100 if k1h[-4]["close"] else 0
+
+        # 强趋势（≥60）：等趋势走坏才止盈，不设固定目标
+        if tr_entry >= 60:
+            # 只有双周期都向下时才考虑止盈
+            if c15_up <= 0 and h1h_up <= 0:
+                scores["tp"] += 8; rtp.append(f"强趋势衰减(15m{h1h_up:+.1f}%+1h{h1h_up:+.1f}%)")
+            # 如果趋势还在，给hold加分防止误止盈
+            if c15_up > 0 or h1h_up > 0:
+                scores["hold"] += 6; rhd.append("强趋势延续")
+        # 弱趋势（40~59）：有利润就走，或接近压力位就走
+        elif tr_entry >= 40:
+            # 见顶信号或压力位接近就止盈
+            space_to_high = (high_24h - mark) / mark * 100 if mark > 0 else 0
+            if space_to_high < 3:
+                scores["tp"] += 10; rtp.append(f"弱趋势+空间耗尽({space_to_high:.1f}%)")
+            # 15m趋势转负就止盈
+            if c15_up <= 0:
+                scores["tp"] += 8; rtp.append("弱趋势+15m转负")
+            # 有利润且接近24h高点
+            if pnl_pct > 2 and space_to_high < 5:
+                scores["tp"] += 6; rtp.append("弱趋势+见好就收")
         if c15_up > 0 and h1h_up > 0:
             trend_strength = max(c15_up, h1h_up)
             if trend_strength > 8:
@@ -551,6 +575,10 @@ def place_new_trade(signals=None):
         set_leverage(best["symbol"], leverage)
         r = place_order(best["symbol"], "BUY", "LONG", qty, leverage)
         if "orderId" in r:
+            # 记录入场评分到tracker，供止盈止损动态调整
+            trk = load_tracker()
+            trk[best["symbol"]] = {"entry_score": timing, "high": price, "trail_sl": None, "tp_triggered": False}
+            save_tracker(trk)
             return {"symbol": best["symbol"], "qty": qty, "price": price, "value": round(qty*price, 1),
                     "leverage": leverage, "reason": f"入场时机{timing}({timing_reason}) 涨幅{best['change']:.1f}% 费率{best['fundingRate']:+.4f}%",
                     "entry_range": best["entry_range"],
@@ -653,29 +681,32 @@ def main():
             sym = p["symbol"]
 
             # 更新最高价追踪
-            tr = tracker.get(sym, {"high": mark, "trail_sl": None, "tp_triggered": False})
+            tr = tracker.get(sym, {"high": mark, "trail_sl": None, "tp_triggered": False, "entry_score": 50})
+            entry_score = tr.get("entry_score", 50)
             if pnl_pct > 0 and mark > tr.get("high", 0):
                 tr["high"] = mark
-                # 价格创新高，调整移动止损
-                tr["trail_sl"] = round(mark * 0.94, 8)  # 从最高点回撤6%触发移动止损
+                # 价格创新高，调整移动止损 — 强趋势宽松，弱趋势收紧
+                trail_pct = 0.94 if entry_score >= 60 else 0.95  # 强趋势回撤6%，弱趋势回撤5%
+                tr["trail_sl"] = round(mark * trail_pct, 8)
             tracker[sym] = tr
 
-            # ① 固定止损：-7%硬止损（最高优先）
+            # ① 动态硬止损：根据入场评分调整止损幅度
             loss = (entry - mark) / entry * 100 if p["amt"] > 0 else (mark - entry) / entry * 100
-            if 7 <= loss < 50:
+            sl_pct = 7 if entry_score >= 60 else 5  # 强趋势扛7%，弱趋势5%就砍
+            if sl_pct <= loss < 50:
                 r = close_position(p["symbol"], p["side"], p["amt"])
-                if "orderId" in r: msg.append(f"🛑 硬止损! {sym} 亏损{loss:.2f}%")
+                if "orderId" in r: msg.append(f"🛑 硬止损! {sym} 亏损{loss:.2f}% (入场评分{entry_score})")
                 else: msg.append(f"⚠️ {sym} 止损失败: {r.get('msg','?')}")
                 tracker.pop(sym, None)
                 save_tracker(tracker)
                 continue
 
-            # ② 移动止损：从高点回撤6%触发（保护利润）
+            # ② 移动止损：从高点回撤触发（保护利润）
             if pnl_pct > 0 and tr.get("trail_sl"):
-                trail_pct = (mark - tr["trail_sl"]) / tr["trail_sl"] * 100
-                if trail_pct < 0:
+                trail_check = (mark - tr["trail_sl"]) / tr["trail_sl"] * 100
+                if trail_check < 0:
                     r = close_position(p["symbol"], p["side"], p["amt"])
-                    if "orderId" in r: msg.append(f"⚠️ 移动止损! {sym} 高点回撤6% 锁定利润{trail_pct:.2f}%")
+                    if "orderId" in r: msg.append(f"⚠️ 移动止损! {sym} 高点回撤锁定利润")
                     else: msg.append(f"⚠️ {sym} 移动止损失败: {r.get('msg','?')}")
                     tracker.pop(sym, None)
                     save_tracker(tracker)
