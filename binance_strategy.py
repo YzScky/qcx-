@@ -306,6 +306,20 @@ def analyze_position(symbol, entry_price, amt):
         if resist_stuck and big_trend <= 0:
             scores["tp"] += 12; rtp.append(f"压力{near_resist:.4f}冲击{touches}次未破")
 
+        # ⑧ 动量衰减止盈 — 15m连续8根K线不创新高+缩量=短期动能衰竭
+        # 适用于强趋势中的正常回调，避免卖飞的同时也能及时止盈
+        if len(k15) >= 10 and pnl_pct > 2:
+            recent_high = max(c["high"] for c in k15[-8:])
+            prev_high = max(c["high"] for c in k15[-12:-8])
+            # 最近8根K线（2小时）没创新高
+            no_new_high = recent_high <= prev_high * 1.002  # 允许0.2%误差
+            # 最近4根成交量相比前4根萎缩
+            v_recent = sum(c["volume"] for c in k15[-4:])
+            v_before = sum(c["volume"] for c in k15[-8:-4])
+            vol_shrink = v_recent < v_before * 0.8 if v_before > 0 else False
+            if no_new_high and vol_shrink:
+                scores["tp"] += 10; rtp.append(f"动量衰减-2h未创新高+缩量")
+
     # 决策
     if pnl_pct <= -7:
         return ("sl", f"亏损{pnl_pct:.2f}%触发止损", 1.0, {"tp":0,"hold":0,"sl":0,"pnl_pct":round(pnl_pct,2),"pullback_24h":round(pullback,1),"chg_24h":round(chg_24h,1),"fr":round(fr,3)})
