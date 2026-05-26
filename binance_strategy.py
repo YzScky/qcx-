@@ -520,30 +520,27 @@ def place_new_trade(signals=None):
     avail = balances["USDT"]["available"]; cnt = len(positions) if positions else 0
     if cnt >= 6: return None
 
-    # 遍历前15名，跳过已有持仓的币
-    for best in signals[:15]:
+    # 第二指标：入场时机 — 评分最高的入场时机优先，越高杠杆越大
+    entries = []
+    for best in signals[:20]:
         if best["symbol"] in existing: continue
-        if best["score"] < 12: continue  # 门槛从6→12，过滤掉低质量信号减少亏损
-        score = best["score"]
-        price = best["price"]
-
-        # 入场时机检查
         timing, timing_reason, entry_range, tp_target = entry_timing(best["symbol"])
         if timing < 10:
-            continue  # 入场时机不佳，跳过等下次
-        
-        # 入场位置过高（>70%区间高位）直接禁止开仓 — 追高是亏损第一原因
-        if "高位" in timing_reason and timing_reason.startswith("高位"):
-            h_pct = 0
-            import re as _re_high
-            hm = _re_high.search(r'(\d+)%', timing_reason)
-            if hm: h_pct = int(hm.group(1))
-            if h_pct >= 70:
-                continue
+            continue
+        entries.append({"symbol": best["symbol"], "price": best["price"],
+                        "change": best["change"], "fundingRate": best["fundingRate"],
+                        "score": timing, "timing_reason": timing_reason,
+                        "entry_range": entry_range, "tp_target": tp_target})
+    if not entries: return None
+    # 按入场评分排序
+    entries.sort(key=lambda x: x["score"], reverse=True)
+    for best in entries:
+        price = best["price"]
+        timing = best["score"]
 
-        if score >= 20:
+        if timing >= 16:
             leverage = 10; target_value = 95
-        elif score >= 15:
+        elif timing >= 13:
             leverage = 8; target_value = 75
         else:
             leverage = 5; target_value = 55
@@ -719,8 +716,11 @@ def main():
                 else: verdict = "建议关注 ❌"
                 msg.append(f"{e} {p['symbol']} {rpt['pnl_pct']:+.2f}% 📊综合{composite}分 {verdict} | {reason}")
     cnt = len(positions) if positions else 0
-    # BTC向下时不开新仓，向上或横盘时正常开
-    if btc_coeff > 0 and cnt < 4 and signals and signals[0]["score"] >= 12:
+    # 🚦 第一指标：BTC大盘环境 — 向下则直接跳过所有开仓逻辑
+    btc_pass = btc_status in ("up", "sideways")
+    if not btc_pass:
+        msg.append("   📛 BTC向下，跳过开仓")
+    if btc_pass and cnt < 4 and signals:
         t = place_new_trade(signals)
         if t: 
             er = t.get('entry_range', (0,0))
