@@ -325,13 +325,13 @@ def scan_market():
     candidates = []
     for t in gainers:
         sym, chg, vol, price = t['symbol'], float(t['priceChangePercent']), float(t['quoteVolume']), float(t['lastPrice'])
-        if chg < 8 or chg > 60 or vol < 500000: continue
+        if chg < 5 or chg > 80 or vol < 300000: continue
         fr = fr_map.get(sym, 0)
         pb = (float(t['highPrice']) - price) / float(t['highPrice']) * 100 if float(t['highPrice']) > 0 else 0
         candidates.append({"symbol": sym, "price": price, "change": chg, "volume": vol, "fundingRate": fr*100, "pullback": pb, "score": 0})
 
-    # 取涨幅前40名，用潜力指标评分（不是看已经涨了多少）
-    for c in candidates[:40]:
+    # 取涨幅前60名，用潜力指标评分（不是看已经涨了多少）
+    for c in candidates[:60]:
         k15 = get_klines(c["symbol"], "15m", 4)
         k1h = get_klines(c["symbol"], "1h", 5)
         k4h = get_klines(c["symbol"], "4h", 3)
@@ -415,7 +415,7 @@ def format_status_header(balances, positions):
 def entry_timing(symbol):
     """
     入场时机评分（0~20分）：判断价格位置是否适合进场
-    - 价格在区间低位 +8
+    - 价格在24h反弹中部 +8（看还有多少空间，不是20根K线位置）
     - 15m短期向上 +4
     - 回调止跌信号 +3
     - 回调缩量 +3
@@ -427,21 +427,41 @@ def entry_timing(symbol):
     if not k15 or len(k15) < 20:
         return 10, "数据不足,保守入场"
     price = k15[-1]["close"]
+
+    # 价格位置：看从24h最低点反弹了多少（相对涨幅启动前位置）
+    # 如果24h从$1.0涨到$1.2，当前$1.08 → 反弹了40%，还在低位→高分
+    t24 = curl_get(f"https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={symbol}")
+    if t24:
+        low_24h = float(t24['lowPrice'])
+        high_24h = float(t24['highPrice'])
+        chg_24h = float(t24['priceChangePercent'])
+        # 24h最低到最高的完整区间
+        full_range = high_24h - low_24h
+        if full_range > 0 and low_24h > 0:
+            # 当前价格在24h区间中的位置（0~100%）
+            rebound_pct = (price - low_24h) / full_range * 100
+        else:
+            rebound_pct = 50
+    else:
+        rebound_pct = 50
+
+    # 同时也算15m区间位置（做参考，但权重降低）
     hi = max(c["high"] for c in k15[-20:])
     lo = min(c["low"] for c in k15[-20:])
     rng = hi - lo
     pos_pct = (price - lo) / rng * 100 if rng > 0 else 50
     s = 0; reasons = []
 
-    # ① 价格位置（8分）
-    if pos_pct <= 25:
-        s += 8; reasons.append(f"低位({pos_pct:.0f}%)")
-    elif pos_pct <= 50:
-        s += 5; reasons.append(f"中低位({pos_pct:.0f}%)")
-    elif pos_pct <= 70:
-        s += 2; reasons.append(f"中高位({pos_pct:.0f}%)")
+    # ① 价格位置（8分）— 看24h反弹位置，不看15m区间
+    # 反弹0-30%=低位大机会，30-55%=良好时机，55-75%=温和，>75%=追高风险
+    if rebound_pct <= 30:
+        s += 8; reasons.append(f"24h反弹低位({rebound_pct:.0f}%)")
+    elif rebound_pct <= 55:
+        s += 6; reasons.append(f"24h反弹中部({rebound_pct:.0f}%)")
+    elif rebound_pct <= 75:
+        s += 3; reasons.append(f"24h反弹偏高({rebound_pct:.0f}%)")
     else:
-        reasons.append(f"高位({pos_pct:.0f}%)-追高风险")
+        reasons.append(f"24h反弹高位({rebound_pct:.0f}%)-追高风险")
 
     # ② 15m短期方向（4分）
     c15_t = (k15[-1]["close"] - k15[-3]["close"]) / k15[-3]["close"] * 100
@@ -506,7 +526,7 @@ def entry_timing(symbol):
     # 远端压力位：20根15m最高点（大周期阻力）
     far_resist = round(hi, 6)
 
-    return s, "; ".join(reasons), (entry_low, entry_high), (near_resist, far_resist)
+    return s, "; ".join(reasons), (entry_low, entry_high), near_resist, far_resist
 
 
 def place_new_trade(signals=None):
@@ -524,13 +544,14 @@ def place_new_trade(signals=None):
     entries = []
     for best in signals[:20]:
         if best["symbol"] in existing: continue
-        timing, timing_reason, entry_range, tp_target = entry_timing(best["symbol"])
+        timing, timing_reason, entry_range, near_resist, far_resist = entry_timing(best["symbol"])
         if timing < 10:
             continue
         entries.append({"symbol": best["symbol"], "price": best["price"],
                         "change": best["change"], "fundingRate": best["fundingRate"],
                         "score": timing, "timing_reason": timing_reason,
-                        "entry_range": entry_range, "tp_target": tp_target})
+                        "entry_range": entry_range,
+                        "near_resist": near_resist, "far_resist": far_resist})
     if not entries: return None
     # 按入场评分排序
     entries.sort(key=lambda x: x["score"], reverse=True)
@@ -555,8 +576,9 @@ def place_new_trade(signals=None):
         r = place_order(best["symbol"], "BUY", "LONG", qty, leverage)
         if "orderId" in r:
             return {"symbol": best["symbol"], "qty": qty, "price": price, "value": round(qty*price, 1),
-                    "leverage": leverage, "reason": f"评分{score} 入场时机{timing}({timing_reason}) 涨幅{best['change']:.1f}% 费率{best['fundingRate']:+.4f}%",
-                    "entry_range": entry_range, "tp_target": tp_target}
+                    "leverage": leverage, "reason": f"入场时机{timing}({timing_reason}) 涨幅{best['change']:.1f}% 费率{best['fundingRate']:+.4f}%",
+                    "entry_range": best["entry_range"],
+                    "near_resist": best["near_resist"], "far_resist": best["far_resist"]}
     return None
 
 def load_tracker():
@@ -619,8 +641,12 @@ def check_btc_market():
     if up >= 3 or (btc_chg > 1 and up >= 2):
         return "up", f"📈 BTC向好(24h{btc_chg:+.1f}% 1h{btc_1h:+.1f}% 4h{btc_4h:+.1f}%), 正常操作", 1.0, btc_price
 
-    # 横盘分化
-    return "sideways", f"➡️ BTC横盘(24h{btc_chg:+.1f}% 1h{btc_1h:+.1f}%), 正常操作", 1.0, btc_price
+    # 横盘分化（涨跌各半）
+    if up >= 1 and down >= 1:
+        return "sideways", f"➡️ BTC横盘(24h{btc_chg:+.1f}% 1h{btc_1h:+.1f}%), 减半开仓", 0.5, btc_price
+
+    # fallback
+    return "unknown", f"❓ BTC信号不明(24h{btc_chg:+.1f}%), 谨慎操作", 0.3, btc_price
 
 
 def main():
@@ -720,11 +746,13 @@ def main():
     btc_pass = btc_status in ("up", "sideways")
     if not btc_pass:
         msg.append("   📛 BTC向下，跳过开仓")
-    if btc_pass and cnt < 4 and signals:
+    # BTC横盘时限制开仓数
+    max_pos = 2 if btc_status == "sideways" else 4
+    if btc_pass and len(positions) < max_pos and signals:
         t = place_new_trade(signals)
         if t: 
             er = t.get('entry_range', (0,0))
-            nr, fr = t.get('tp_target', (0,0))
+            nr, fr = t.get('near_resist', 0), t.get('far_resist', 0)
             msg.append(f"🚀 新开仓! {t['symbol']} {t['qty']}张 {t['leverage']}x 价值${t['value']} @${t['price']:.4f} ({t['reason']})")
             msg.append(f"   📊 区间: ${er[0]:.4f}~${er[1]:.4f} 🔴压力: ${nr:.4f}→${fr:.4f}")
     print(format_status_header(balances, positions))
