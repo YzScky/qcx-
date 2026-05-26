@@ -342,6 +342,7 @@ def place_order(symbol, side, pos_side, qty, leverage=3):
 def set_leverage(symbol, lev): api_post("/fapi/v1/leverage", f"symbol={symbol}&leverage={lev}")
 
 def scan_market():
+    """按24h涨幅排行取前20名，不评分不过滤"""
     tickers = curl_get("https://fapi.binance.com/fapi/v1/ticker/24hr")
     if not tickers: return None
     valid = [t for t in tickers if t['symbol'].endswith('USDT')
@@ -350,79 +351,18 @@ def scan_market():
     gainers = sorted(valid, key=lambda x: float(x['priceChangePercent']), reverse=True)
     funding = curl_get("https://fapi.binance.com/fapi/v1/premiumIndex")
     fr_map = {f['symbol']: float(f['lastFundingRate']) for f in funding} if funding else {}
+
     signals = []
-    candidates = []
-    for t in gainers:
+    for t in gainers[:20]:
         sym, chg, vol, price = t['symbol'], float(t['priceChangePercent']), float(t['quoteVolume']), float(t['lastPrice'])
         if chg < 5 or chg > 80 or vol < 300000: continue
         fr = fr_map.get(sym, 0)
         pb = (float(t['highPrice']) - price) / float(t['highPrice']) * 100 if float(t['highPrice']) > 0 else 0
-        candidates.append({"symbol": sym, "price": price, "change": chg, "volume": vol, "fundingRate": fr*100, "pullback": pb, "score": 0})
-
-    # 取涨幅前60名，用潜力指标评分（不是看已经涨了多少）
-    for c in candidates[:60]:
-        k15 = get_klines(c["symbol"], "15m", 4)
-        k1h = get_klines(c["symbol"], "1h", 5)
-        k4h = get_klines(c["symbol"], "4h", 3)
-
-        score = 0
-        reasons = []
-
-        # ① 资金费率（最大20分）— 空头挤压潜力，独立于价格位置
-        fr = c["fundingRate"]
-        if fr < -0.1:
-            score += 20; reasons.append(f"费率{fr:.2f}%-强烈空头挤压")
-        elif fr < -0.05:
-            score += 15; reasons.append(f"费率{fr:.2f}%-空头挤压")
-        elif fr < -0.01:
-            score += 10; reasons.append(f"费率{fr:.2f}%-轻度空头")
-        elif fr < 0:
-            score += 5; reasons.append(f"费率{fr:.2f}%-微负")
-
-        # ② 成交量爆发（最高15分）— 看最近1h量对比前几小时是否放量，资金刚进场
-        if k1h and len(k1h) >= 4:
-            last_vol = k1h[-1]["volume"]
-            prev_vols = sum(k["volume"] for k in k1h[-4:-1]) / 3
-            vol_surge = last_vol / prev_vols if prev_vols > 0 else 1
-            if vol_surge > 3:
-                score += 15; reasons.append(f"放量{vol_surge:.1f}x-资金爆发")
-            elif vol_surge > 2:
-                score += 10; reasons.append(f"放量{vol_surge:.1f}x-资金进场")
-            elif vol_surge > 1.5:
-                score += 5; reasons.append(f"放量{vol_surge:.1f}x-量能放大")
-
-        # ③ 多周期共振刚刚形成（最高15分）— 15m和1h刚刚同时翻多，不是已经涨了很久
-        c15_t = 0
-        h1h_t = 0
-        h4h_t = 0
-        if k15 and len(k15) >= 3:
-            c15_t = (k15[-1]["close"] - k15[-3]["close"]) / k15[-3]["close"] * 100
-        if k1h and len(k1h) >= 3:
-            h1h_t = (k1h[-1]["close"] - k1h[-3]["close"]) / k1h[-3]["close"] * 100
-        if k4h and len(k4h) >= 2:
-            h4h_t = (k4h[-1]["close"] - k4h[-2]["close"]) / k4h[-2]["close"] * 100
-
-        # 刚共振：短时间内多周期同时翻多（表示趋势刚开始）
-        if c15_t > 0 and h1h_t > 0:
-            score += 10; reasons.append(f"15m1h共振向上")
-            if h4h_t > 0:
-                score += 5; reasons.append("4h也向上-全周期共振")
-        elif c15_t > 0 or h1h_t > 0:
-            score += 3; reasons.append("单周期向上")
-
-        # ④ 24h涨幅（最高10分）— 基础动能，但不给太高权重
-        chg = c["change"]
-        if 8 <= chg <= 20:
-            score += 10; reasons.append(f"涨幅{chg:.0f}%-启动区")
-        elif 20 < chg <= 30:
-            score += 5; reasons.append(f"涨幅{chg:.0f}%-拉升中")
-        elif 30 < chg <= 60:
-            score += 2; reasons.append(f"涨幅{chg:.0f}%-高位")
-
-        c["score"] = round(score, 1)
-        signals.append(c)
-    signals.sort(key=lambda x: x["score"], reverse=True)
-    return signals[:30]
+        # 只用来排序，评分统一设为涨幅值方便显示
+        signals.append({"symbol": sym, "price": price, "change": chg, "volume": vol,
+                        "fundingRate": round(fr*100, 4), "pullback": round(pb, 1), "score": round(chg, 1)})
+    signals.sort(key=lambda x: x["change"], reverse=True)
+    return signals[:20]
 
 def format_status_header(balances, positions):
     now = datetime.now().strftime("%m/%d %H:%M")
