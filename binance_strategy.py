@@ -12,7 +12,7 @@ from collections import Counter
 PROXY = "socks5://127.0.0.1:7891"
 CURLE = ["curl", "-s", "--connect-timeout", "5", "--max-time", "10", "--socks5-hostname", "127.0.0.1:7891"]
 
-def get_api_keys():
+def _load_keys():
     with open(os.path.expanduser("~/.binance/trading")) as f:
         lines = f.read().strip().split("\n")
         api = {}
@@ -22,29 +22,37 @@ def get_api_keys():
                 api[k.strip()] = v.strip()
         return api["api-key"], api["api-secret"]
 
-API_KEY, SECRET = get_api_keys()
+API_KEY, SECRET = _load_keys()
 
 def sign_request(params_str):
     return hmac.new(SECRET.encode(), params_str.encode(), hashlib.sha256).hexdigest()
 
-def api_get(path, params=None):
+def _curl_auth(method, path, data_str=None):
+    """Use curl+SOCKS5 for authenticated Binance API calls (urllib doesn't support SOCKS5)."""
     ts = int(time.time()*1000)
-    qs = f"timestamp={ts}&recvWindow=50000"
-    if params: qs += "&" + params
+    if data_str:
+        qs = f"{data_str}&timestamp={ts}&recvWindow=50000"
+    else:
+        qs = f"timestamp={ts}&recvWindow=50000"
     sig = sign_request(qs)
-    req = urllib.request.Request(f"https://fapi.binance.com{path}?{qs}&signature={sig}", headers={"X-MBX-APIKEY": API_KEY})
+    url = f"https://fapi.binance.com{path}?{qs}&signature={sig}"
+    cmd = CURLE + ["-H", f"X-MBX-APIKEY: {API_KEY}"]
+    if method == "POST":
+        cmd += ["-X", "POST"]
+    cmd.append(url)
     try:
-        with urllib.request.urlopen(req, timeout=15) as r: return json.loads(r.read())
-    except Exception as e: return {"error": str(e)}
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        if r.stdout.strip():
+            return json.loads(r.stdout)
+        return {"error": f"Empty response: {r.stderr[:200]}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+def api_get(path, params=None):
+    return _curl_auth("GET", path, params)
 
 def api_post(path, data_str):
-    ts = int(time.time()*1000)
-    qs = f"{data_str}&timestamp={ts}&recvWindow=50000"
-    sig = sign_request(qs)
-    req = urllib.request.Request(f"https://fapi.binance.com{path}", data=f"{qs}&signature={sig}".encode(), headers={"X-MBX-APIKEY": API_KEY})
-    try:
-        with urllib.request.urlopen(req, timeout=15) as r: return json.loads(r.read())
-    except Exception as e: return {"error": str(e)}
+    return _curl_auth("POST", path, data_str)
 
 def curl_get(url):
     try:
@@ -114,19 +122,40 @@ def analyze_position(symbol, entry_price, amt):
             h4h_t = (k4h_pos[-1]["close"] - k4h_pos[-2]["close"]) / k4h_pos[-2]["close"] * 100 if k4h_pos[-2]["close"] else 0
         big_trend = h1h_t + h4h_t
 
-        # 大周期持续下跌防守：1h连续阴线≥6根（6小时持续下跌），直接止损
-        # 防止缩量健康回调的误判，保护在加速下跌行情中
-        if k1h and len(k1h) >= 8:
-            cons_1h_down = 0
-            for c in reversed(k1h[-8:]):
-                if c["close"] < c["open"]:
-                    cons_1h_down += 1
-                else:
-                    break
-            if cons_1h_down >= 6:
-                scores["sl"] += 25; rsl.append(f"1h连{cons_1h_down}阴-趋势加速下跌")
-            elif cons_1h_down >= 4:
-                scores["sl"] += 12; rsl.append(f"1h连{cons_1h_down}阴-持续弱势")
+    # 大周期持续下跌防守：1h连续阴线检测 + 15m连续下跌加速（2026-05-31升级）
+    # 不管HLD/T分数多少，只要连续阴线达标就强制触发sl
+    if k1h and len(k1h) >= 8:
+        cons_1h_down = 0
+        for c in reversed(k1h[-8:]):
+            if c["close"] < c["open"]:
+                cons_1h_down += 1
+            else:
+                break
+        if cons_1h_down >= 6:
+            scores["sl"] += 25; rsl.append(f"1h连{cons_1h_down}阴-趋势加速下跌")
+        elif cons_1h_down >= 4:
+            scores["sl"] += 12; rsl.append(f"1h连{cons_1h_down}阴-持续弱势")
+        # 新增：1小时连3阴+15m也向下→轻度警告
+        if cons_1h_down >= 3:
+            # 再加15m连续下跌检查
+            k15_for_check = get_klines(symbol, "15m", 6)
+            if k15_for_check and len(k15_for_check) >= 4:
+                cons_15m_down = sum(1 for c in k15_for_check[-4:] if c["close"] < c["open"])
+                if cons_15m_down >= 3:
+                    scores["sl"] += 8; rsl.append(f"15m连{cons_15m_down}跌")
+
+    # 新增：15m连续阴线单独检测（2026-05-31）- 短期加速下跌
+    # 如果最近4根15m K线有≥3根阴线且最后一根也收阴，直接触发止损
+    if k5 and len(k5) >= 6:
+        k5_recent = k5[-6:]
+        cons_5m_down = 0
+        for c in reversed(k5_recent):
+            if c["close"] < c["open"]:
+                cons_5m_down += 1
+            else:
+                break
+        if cons_5m_down >= 5:
+            scores["sl"] += 15; rsl.append(f"5m连{cons_5m_down}阴-加速下跌")
 
         # 压力位判断：用15m K线看近端压力和冲击次数
         k15_h26 = sorted([c["high"] for c in k15], reverse=True)
@@ -492,6 +521,19 @@ def entry_timing(symbol):
     elif up_count >= 3:
         score += 5; reasons.append(f"买盘略优({up_count}阳)")
 
+    # ====== 超买惩罚（2026-05-31 新增）：连续阳线过多=超买衰竭风险 ======
+    # 检查最近15根15m K线，如果阳线比例>=80%则惩罚
+    k15_extended = get_klines(symbol, "15m", 15)
+    if k15_extended and len(k15_extended) >= 12:
+        total_green = sum(1 for c in k15_extended if c["close"] >= c["open"])
+        green_ratio = total_green / len(k15_extended)
+        if green_ratio >= 0.80:
+            penalty = -15; reasons.append(f"超买惩罚(15m阳{total_green}/{len(k15_extended)}={green_ratio:.0%})")
+            score += penalty
+        elif green_ratio >= 0.70:
+            penalty = -8; reasons.append(f"偏热(15m阳{total_green}/{len(k15_extended)}={green_ratio:.0%})")
+            score += penalty
+
     # ========== ③ 上涨空间（40分） ==========
 
     # 离24h最高点距离
@@ -542,29 +584,25 @@ def place_new_trade(signals=None):
     avail = balances["USDT"]["available"]; cnt = len(positions) if positions else 0
     if cnt >= 6: return None
 
-    # 第二指标：入场时机 — 评分最高的入场时机优先，越高杠杆越大
-    entries = []
+    # 按scan_market评分从高到低遍历，入场时机过滤，第一个过线的就开
     for best in signals[:20]:
         if best["symbol"] in existing: continue
+        price = best["price"]
+
         timing, timing_reason, entry_range, near_resist, far_resist = entry_timing(best["symbol"])
         if timing < 40:
-            continue
-        entries.append({"symbol": best["symbol"], "price": best["price"],
-                        "change": best["change"], "fundingRate": best["fundingRate"],
-                        "score": timing, "timing_reason": timing_reason,
-                        "entry_range": entry_range,
-                        "near_resist": near_resist, "far_resist": far_resist})
-    if not entries: return None
-    # 按入场评分排序
-    entries.sort(key=lambda x: x["score"], reverse=True)
-    for best in entries:
-        price = best["price"]
-        timing = best["score"]
+            continue  # 入场时机不过关就跳过，看下一个
 
-        if timing >= 60:
+        # 仓位分层（2026-05-31 升级）：防止临界评分重仓
+        # >=75: 满仓10x/95u（趋势强+空间大+量价健康）
+        # 60-74: 半仓5x/55u（趋势尚可但有疑虑）
+        # 40-59: 轻仓3x/30u（临界入场，轻仓试探）
+        if timing >= 75:
             leverage = 10; target_value = 95
-        else:
+        elif timing >= 60:
             leverage = 5; target_value = 55
+        else:
+            leverage = 3; target_value = 30
 
         max_value = min(target_value, avail * leverage * 0.6)
         if max_value < 10: continue
@@ -575,14 +613,13 @@ def place_new_trade(signals=None):
         set_leverage(best["symbol"], leverage)
         r = place_order(best["symbol"], "BUY", "LONG", qty, leverage)
         if "orderId" in r:
-            # 记录入场评分到tracker，供止盈止损动态调整
             trk = load_tracker()
             trk[best["symbol"]] = {"entry_score": timing, "high": price, "trail_sl": None, "tp_triggered": False}
             save_tracker(trk)
             return {"symbol": best["symbol"], "qty": qty, "price": price, "value": round(qty*price, 1),
-                    "leverage": leverage, "reason": f"入场时机{timing}({timing_reason}) 涨幅{best['change']:.1f}% 费率{best['fundingRate']:+.4f}%",
-                    "entry_range": best["entry_range"],
-                    "near_resist": best["near_resist"], "far_resist": best["far_resist"]}
+                    "leverage": leverage, "reason": f"评分{best['score']} 入场时机{timing}({timing_reason}) 涨幅{best['change']:.1f}% 费率{best['fundingRate']:+.4f}%",
+                    "entry_range": entry_range,
+                    "near_resist": near_resist, "far_resist": far_resist}
     return None
 
 def load_tracker():
@@ -603,7 +640,7 @@ def save_tracker(tracker):
 
 def check_btc_market():
     """判断BTC大盘环境，返回(状态, 描述, 操作系数, BTC价格)
-    三档：向下→不开仓  横盘→正常  向上→积极
+    新增冷却机制：15mK线收阴且趋势向下→停15分钟，1hK线收阴且趋势向下→停30分钟
     用15m+1h+4h+24h四个维度综合判断
     """
     t = curl_get("https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=BTCUSDT")
@@ -611,25 +648,59 @@ def check_btc_market():
     btc_chg = float(t['priceChangePercent'])
     btc_price = float(t['lastPrice'])
 
-    # 15m趋势
-    k15 = get_klines("BTCUSDT", "15m", 4)
+    k15 = get_klines("BTCUSDT", "15m", 5)
     btc_15m = 0
     if k15 and len(k15) >= 3:
         btc_15m = (k15[-1]["close"] - k15[-3]["close"]) / k15[-3]["close"] * 100
 
-    # 1h趋势
     k1h = get_klines("BTCUSDT", "1h", 4)
     btc_1h = 0
     if k1h and len(k1h) >= 3:
         btc_1h = (k1h[-1]["close"] - k1h[-3]["close"]) / k1h[-3]["close"] * 100
 
-    # 4h趋势
-    k4h = get_klines("BTCUSDT", "4h", 3)
+    k4h = get_klines("BTCUSDT", "4h", 4)
     btc_4h = 0
     if k4h and len(k4h) >= 2:
         btc_4h = (k4h[-1]["close"] - k4h[-2]["close"]) / k4h[-2]["close"] * 100
 
-    # 看四个维度中涨的多还是跌的多
+    # BTC冷却时间机制 ==== 升级版：1h趋势向下直接关停开仓 ====
+    cd_file = os.path.expanduser("~/.hermes/scripts/btc_cooldown.json")
+    cd = {"until_15m": 0, "until_1h": 0}
+    if os.path.exists(cd_file):
+        try:
+            with open(cd_file) as f: cd = json.load(f)
+        except: pass
+
+    now = time.time()
+    cd_15m = now < cd.get("until_15m", 0)
+    cd_1h = now < cd.get("until_1h", 0)
+
+    # 15m K线收阴 + 趋势向下 → 触发15分钟冷却
+    if k15 and len(k15) >= 2:
+        last = k15[-1]
+        if last["close"] < last["open"] and btc_15m < 0 and not cd_15m:
+            cd["until_15m"] = now + 15 * 60
+            with open(cd_file, "w") as f: json.dump(cd, f)
+            cd_15m = True
+
+    # 1h K线收阴 + 趋势向下 → 触发30分钟冷却
+    if k1h and len(k1h) >= 2:
+        last = k1h[-1]
+        if last["close"] < last["open"] and btc_1h < 0 and not cd_1h:
+            cd["until_1h"] = now + 30 * 60
+            with open(cd_file, "w") as f: json.dump(cd, f)
+            cd_1h = True
+
+    cd_msgs = []
+    if cd_15m:
+        r = int(cd["until_15m"] - now)
+        cd_msgs.append(f"15m冷却{r//60}m{r%60}s")
+    if cd_1h:
+        r = int(cd["until_1h"] - now)
+        cd_msgs.append(f"1h冷却{r//60}m{r%60}s")
+    if cd_msgs:
+        return "cooldown", f"💤 BTC冷却中({'|'.join(cd_msgs)}), 仅参考", 1.0, btc_price
+
     up = sum(1 for v in [btc_15m, btc_1h, btc_4h, btc_chg] if v > 0)
     down = sum(1 for v in [btc_15m, btc_1h, btc_4h, btc_chg] if v < 0)
 
@@ -695,7 +766,8 @@ def main():
             sl_pct = 7 if entry_score >= 60 else 5  # 强趋势扛7%，弱趋势5%就砍
             if sl_pct <= loss < 50:
                 r = close_position(p["symbol"], p["side"], p["amt"])
-                if "orderId" in r: msg.append(f"🛑 硬止损! {sym} 亏损{loss:.2f}% (入场评分{entry_score})")
+                if "orderId" in r:
+                    msg.append(f"🛑 硬止损! {sym} 亏损{loss:.2f}% (入场评分{entry_score})")
                 else: msg.append(f"⚠️ {sym} 止损失败: {r.get('msg','?')}")
                 tracker.pop(sym, None)
                 save_tracker(tracker)
@@ -749,13 +821,13 @@ def main():
                 else: verdict = "建议关注 ❌"
                 msg.append(f"{e} {p['symbol']} {rpt['pnl_pct']:+.2f}% 📊综合{composite}分 {verdict} | {reason}")
     cnt = len(positions) if positions else 0
-    # 🚦 第一指标：BTC大盘环境 — 向下则直接跳过所有开仓逻辑
-    btc_pass = btc_status in ("up", "sideways")
-    if not btc_pass:
-        msg.append("   📛 BTC向下，跳过开仓")
-    # BTC横盘时限制开仓数
-    max_pos = 2 if btc_status == "sideways" else 4
-    if btc_pass and len(positions) < max_pos and signals:
+    # 🚦 BTC不限制开仓，仅作参考（2026-05-31用户要求取消所有限制）
+    # 只保留冷却提醒，不阻止开仓
+    # 当日亏损停盘已取消 — 评分严格把关，自负盈亏
+
+    # 开仓：只检查持仓上限，不限制
+    max_pos = 6
+    if len(positions) < max_pos and signals:
         t = place_new_trade(signals)
         if t: 
             er = t.get('entry_range', (0,0))
