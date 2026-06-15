@@ -791,15 +791,15 @@ def place_new_trade(signals=None):
         except: pass
     now_ts = time.time()
 
-    # 按scan_market评分从高到低遍历，入场时机过滤，第一个过线的就开
+    # 先扫全部候选，计算每个币的入场评分，选timing最高的开
+    candidates = []
     for best in signals[:20]:
         if best["symbol"] in existing: continue
 
         # 🔥 止损冷却检查：兼容两种数据格式（旧版list/新版dict）
         sc_entry = sc_data.get(best["symbol"], {})
         if isinstance(sc_entry, list):
-            # 旧格式：时间戳列表 → 转为dict格式（只处理前3次）
-            stop_count = len([t for t in sc_entry if time.time() - t < 86400])  # 24h内
+            stop_count = len([t for t in sc_entry if time.time() - t < 86400])
             cooldown_until = 0
         else:
             stop_count = sc_entry.get("count", 0)
@@ -808,41 +808,52 @@ def place_new_trade(signals=None):
             remain = int(cooldown_until - now_ts)
             print(f"  ⏳ {best['symbol']} 已止损{stop_count}次, 冷却中({remain//60}m{remain%60}s)")
             continue
-        # 冷却过期了就清零重新计数
         if stop_count >= 3 and now_ts >= cooldown_until:
             sc_data[best["symbol"]] = {"count": 0, "cooldown_until": 0}
 
-        price = best["price"]
-
         timing, timing_reason, entry_range, near_resist, far_resist = entry_timing(best["symbol"])
         if timing < 40:
-            continue  # 入场时机不过关就跳过，看下一个
+            continue
 
-        # 仓位分层：开仓金额固定40~80u，按评分调杠杆
-        if timing >= 75:
-            leverage = 10; target_value = 90
-        elif timing >= 60:
-            leverage = 8; target_value = 70
-        else:
-            leverage = 5; target_value = 50
+        candidates.append({
+            "symbol": best["symbol"], "price": best["price"],
+            "timing": timing, "timing_reason": timing_reason,
+            "entry_range": entry_range, "near_resist": near_resist, "far_resist": far_resist,
+            "score": best["score"], "change": best["change"], "fundingRate": best["fundingRate"]
+        })
 
-        max_value = min(target_value, avail * leverage * 0.6)
-        if max_value < 10: continue
+    # 按timing评分从高到低排序，选最高的开
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x["timing"], reverse=True)
+    best = candidates[0]
 
-        qty = max(1, int(max_value / price))
-        if qty * price < 5: continue
+    # 仓位分层：开仓金额固定40~80u，按评分调杠杆
+    timing = best["timing"]
+    if timing >= 75:
+        leverage = 10; target_value = 90
+    elif timing >= 60:
+        leverage = 8; target_value = 70
+    else:
+        leverage = 5; target_value = 50
 
-        set_leverage(best["symbol"], leverage)
-        r = place_order(best["symbol"], "BUY", "LONG", qty, leverage)
-        if "orderId" in r:
-            trk = load_tracker()
-            trk[best["symbol"]] = {"entry_score": timing, "high": price, "trail_sl": None, "tp_triggered": False}
-            save_tracker(trk)
-            return {"symbol": best["symbol"], "qty": qty, "price": price, "value": round(qty*price, 1),
-                    "leverage": leverage, "reason": f"评分{best['score']} 入场时机{timing}({timing_reason}) 涨幅{best['change']:.1f}% 费率{best['fundingRate']:+.4f}%",
-                    "entry_range": entry_range,
-                    "near_resist": near_resist, "far_resist": far_resist}
-    return None
+    max_value = min(target_value, avail * leverage * 0.6)
+    if max_value < 10: return None
+
+    qty = max(1, int(max_value / best["price"]))
+    if qty * best["price"] < 5: return None
+
+    set_leverage(best["symbol"], leverage)
+    r = place_order(best["symbol"], "BUY", "LONG", qty, leverage)
+    if "orderId" in r:
+        trk = load_tracker()
+        trk[best["symbol"]] = {"entry_score": timing, "high": best["price"], "trail_sl": None, "tp_triggered": False}
+        save_tracker(trk)
+        return {"symbol": best["symbol"], "qty": qty, "price": best["price"], "value": round(qty*best["price"], 1),
+                "leverage": leverage, "reason": f"评分{best['score']} 入场时机{timing}({best['timing_reason']}) 涨幅{best['change']:.1f}% 费率{best['fundingRate']:+.4f}%",
+                "entry_range": best["entry_range"],
+                "near_resist": best["near_resist"], "far_resist": best["far_resist"]}
+
 
 def load_tracker():
     """加载持仓追踪状态（最高价、止损线）"""
