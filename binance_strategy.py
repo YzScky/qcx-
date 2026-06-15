@@ -780,7 +780,7 @@ def place_new_trade(signals=None):
     balances, _ = get_account()
     if not balances or "USDT" not in balances: return None
     avail = balances["USDT"]["available"]; cnt = len(positions) if positions else 0
-    if cnt >= 6: return None
+    if cnt >= 7: return None
 
     # 加载全局止损冷却（阶梯式：3次→1h, 4次→5h, 5次→24h）
     sc_file = os.path.expanduser("~/.hermes/scripts/stop_cooldown.json")
