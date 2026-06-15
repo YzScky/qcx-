@@ -1226,9 +1226,16 @@ def main():
         print("\n--- 动作 ---")
         for m in msg: print(m)
     if signals:
-        print("\n📡 TOP 信号:")
-        for s in signals[:15]:
-            print(f"  {s['symbol']:10s} ${s['price']:<8.4f} +{s['change']:.1f}% 回调:{s['pullback']:.1f}% 费率:{s['fundingRate']:+.4f}% 评分:{s['score']}")
+        print("\n📡 TOP 信号 (按入场评分排序):")
+        # 计算top 40的entry_timing评分
+        top_signals = []
+        for s in signals[:40]:
+            timing, _, _, _, _ = entry_timing(s["symbol"])
+            if timing >= 0:
+                top_signals.append((s, timing))
+        top_signals.sort(key=lambda x: x[1], reverse=True)
+        for s, timing in top_signals[:15]:
+            print(f"  {s['symbol']:10s} ${s['price']:<8.4f} +{s['change']:.1f}% 回调:{s['pullback']:.1f}% 费率:{s['fundingRate']:+.4f}% timing:{timing}")
 
 if __name__ == "__main__":
     main()
