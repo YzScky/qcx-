@@ -84,7 +84,7 @@ def get_klines(symbol, interval="5m", limit=20):
     data = curl_get(f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}")
     if data:
         return [{"time": k[0]/1000, "open": float(k[1]), "high": float(k[2]), "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])} for k in data]
-    return None
+    return []
 
 def analyze_position(symbol, entry_price, amt):
     """
@@ -95,18 +95,25 @@ def analyze_position(symbol, entry_price, amt):
     if not mark: return ("hold", "无法获取价格", 0.5, {})
     pnl_pct = (mark - entry_price) / entry_price * 100 if amt > 0 else (entry_price - mark) / entry_price * 100
     t = curl_get(f"https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={symbol}")
-    high_24h = float(t['highPrice']) if t else mark
-    low_24h = float(t['lowPrice']) if t else mark
-    chg_24h = float(t['priceChangePercent']) if t else 0
+    if isinstance(t, dict):
+        high_24h = float(t.get('highPrice', mark))
+        low_24h = float(t.get('lowPrice', mark))
+        chg_24h = float(t.get('priceChangePercent', 0))
+    else:
+        high_24h = low_24h = mark
+        chg_24h = 0
     pullback = (high_24h - mark) / high_24h * 100 if high_24h > 0 else 0
     funding = curl_get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}")
-    fr = float(funding['lastFundingRate']) * 100 if funding else 0
+    fr = float(funding['lastFundingRate']) * 100 if isinstance(funding, dict) and funding.get('lastFundingRate') else 0
     k5 = get_klines(symbol, "5m", 24)
     k15 = get_klines(symbol, "15m", 12)
     k1h = get_klines(symbol, "1h", 8)
 
     scores = {"tp": 0, "hold": 0, "sl": 0}
     rtp, rhd, rsl = [], [], []
+
+    # Default values for trend variables (may be set inside k5/k15/k1h block)
+    c5_t, c15_t, h1h_t, big_trend = 0, 0, 0, 0
 
     if k5 and k15 and k1h:
         c5 = [(c["close"]-c["open"])/c["open"]*100 for c in k5[-5:]]
@@ -143,6 +150,11 @@ def analyze_position(symbol, entry_price, amt):
                 cons_15m_down = sum(1 for c in k15_for_check[-4:] if c["close"] < c["open"])
                 if cons_15m_down >= 3:
                     scores["sl"] += 8; rsl.append(f"15m连{cons_15m_down}跌")
+
+    # 压力位相关变量的默认值（可能被if k5 and len(k5) >= 6:块内覆盖）
+    near_resist = mark
+    resist_stuck = False
+    touches = 0
 
     # 新增：15m连续阴线单独检测（2026-05-31）- 短期加速下跌
     # 如果最近4根15m K线有≥3根阴线且最后一根也收阴，直接触发止损
@@ -264,7 +276,7 @@ def analyze_position(symbol, entry_price, amt):
         sup += [low_24h, sum(c["close"] for c in k5[-5:])/5, sum(c["close"] for c in k5[-10:])/10]
         d2s = min(abs(mark-s)/mark*100 for s in sup if s < mark) if any(s < mark for s in sup) else 999
         d2r = min(abs(r-mark)/mark*100 for r in res if r > mark) if any(r > mark for r in res) else 999
-        d2s15 = (mark-min(c["low"] for c in k15))/mark*100 if mark > min(c["low"] for c in k15) else 999
+        d2s15 = (mark-min(c["low"] for c in k15))/mark*100 if k15 and mark > min(c["low"] for c in k15) else 999
         if (d2s < 2 or d2s15 < 3) and pnl_pct < 5: scores["hold"] += 10; rhd.append(f"近支撑(d{d2s:.1f}%/{d2s15:.1f}%)")
         if d2r < 2 and pnl_pct > 5: scores["tp"] += 8
         h5, l5 = max(c["high"] for c in k5), min(c["low"] for c in k5)
@@ -373,48 +385,130 @@ def analyze_position(symbol, entry_price, amt):
             if no_new_high and vol_shrink:
                 scores["tp"] += 10; rtp.append(f"动量衰减-2h未创新高+缩量")
 
-    # 决策
-    if pnl_pct <= -7:
-        return ("sl", f"亏损{pnl_pct:.2f}%触发止损", 1.0, {"tp":0,"hold":0,"sl":0,"pnl_pct":round(pnl_pct,2),"pullback_24h":round(pullback,1),"chg_24h":round(chg_24h,1),"fr":round(fr,3)})
-    max_ = max(scores["tp"], scores["hold"], scores["sl"])
-    if max_ == 0: action, reason, conf = "hold", f"趋势平稳({pnl_pct:+.1f}%)", 0.5
-    elif scores["tp"] == max_ and scores["tp"] > scores["hold"]: action, reason, conf = "tp", "; ".join(rtp[:2]), min(0.5+max_/60,0.95)
-    elif scores["sl"] == max_ and scores["sl"] >= scores["hold"]: action, reason, conf = "sl", "; ".join(rsl[:2]), min(0.5+max_/40,0.95)
-    else: action, reason, conf = "hold", "; ".join(rhd[:2]) if rhd else f"趋势健康({pnl_pct:+.1f}%)", min(0.5+max_/50,0.85)
+    # 决策：只输出评分报告给main循环，main自己决定执行什么
     report = {**scores, "pnl_pct": round(pnl_pct,2), "pullback_24h": round(pullback,1), "chg_24h": round(chg_24h,1), "fr": round(fr,3)}
-    return (action, reason, round(conf,2), report)
+    # 构建reason：取分数最高的维度作为描述
+    all_reasons = []
+    if rhd: all_reasons.append("; ".join(rhd[:2]))
+    if rsl: all_reasons.append("; ".join(rsl[:2]))
+    if rtp: all_reasons.append("; ".join(rtp[:2]))
+    reason = "; ".join(all_reasons[:3]) if all_reasons else f"趋势健康({pnl_pct:+.1f}%)"
+    return ("hold", reason, 0.5, report)
+
+def _check_structural_stop(symbol, entry_price, amt, side):
+    """结构止损检查：判断价格是否跌破关键结构位
+    返回 (triggered, reason, threshold_price)
+    """
+    mark = get_mark_price(symbol)
+    if not mark: return False, "", None
+    
+    k15 = get_klines(symbol, "15m", 12)
+    if not k15 or len(k15) < 8:
+        return False, "", None
+    
+    # 1) 15m前低（最近8根K线的最低点）
+    k15_lows = [c["low"] for c in k15[-8:]]
+    recent_low = min(k15_lows)
+    break_pct = (mark - recent_low) / mark * 100 if mark > 0 else 0
+    
+    # 2) 入场后最高点回撤
+    high_since_entry = max(c["high"] for c in k15)
+    retrace_from_high = (high_since_entry - mark) / high_since_entry * 100 if high_since_entry > 0 else 0
+    
+    reasons = []
+    
+    # 条件A：跌破15m前低
+    if break_pct < 0:
+        reasons.append(f"跌破15m前低({recent_low:.5f})")
+    
+    # 条件B：从高点回撤超过5%且跌破入场价
+    if retrace_from_high > 5 and mark < entry_price:
+        reasons.append(f"结构破坏(回撤{retrace_from_high:.1f}%且破入场价)")
+    
+    if reasons:
+        return True, "; ".join(reasons), recent_low
+    return False, "", None
+
+
+def _calc_trail_sl(entry_score, hold_score):
+    """根据趋势强度计算移动止损比例
+    弱趋势 5%, 普通 7%, 强趋势 9%
+    """
+    if entry_score >= 70 or hold_score >= 70:
+        return 0.09  # 强趋势 9%
+    elif entry_score >= 60 or hold_score >= 60:
+        return 0.07  # 普通趋势 7%
+    else:
+        return 0.05  # 弱趋势 5%
+_STEP_CACHE = {}
+_STEP_CACHE_TIME = 0
+
+def _get_step_size(symbol):
+    """获取交易对的最小交易精度（stepSize），带缓存（每60秒刷新）"""
+    global _STEP_CACHE, _STEP_CACHE_TIME
+    now = time.time()
+    if now - _STEP_CACHE_TIME > 60:
+        # 缓存过期，拉全量
+        info = curl_get("https://fapi.binance.com/fapi/v1/exchangeInfo")
+        if info and "symbols" in info:
+            _STEP_CACHE = {}
+            for s in info["symbols"]:
+                for f in s.get("filters", []):
+                    if f["filterType"] == "LOT_SIZE":
+                        step = float(f["stepSize"])
+                        _STEP_CACHE[s["symbol"]] = 1.0 if step >= 1 else step
+                        break
+            _STEP_CACHE_TIME = now
+    if symbol in _STEP_CACHE:
+        return _STEP_CACHE[symbol]
+    return 0.001  # fallback
+
+def _round_qty(qty, step_size):
+    """向下取整到stepSize的倍数"""
+    if step_size <= 0: return qty
+    if step_size >= 1:
+        # 整数步长（stepSize>=1），直接取整
+        return int(qty // step_size) * int(step_size)
+    step_str = f"{step_size:.10f}".rstrip('0')
+    if '.' in step_str:
+        precision = len(step_str.split('.')[1])
+    else:
+        precision = 0
+    return round(int(qty / step_size) * step_size, precision + 1)
 
 def close_position(symbol, side, amt):
-    abs_amt = abs(amt); side_to_close = "SELL" if amt > 0 else "BUY"
-    return api_post("/fapi/v1/order", f"symbol={symbol}&side={side_to_close}&type=MARKET&quantity={abs_amt}&positionSide={side}")
+    step = _get_step_size(symbol)
+    qty = _round_qty(abs(amt), step)
+    side_to_close = "SELL" if amt > 0 else "BUY"
+    return api_post("/fapi/v1/order", f"symbol={symbol}&side={side_to_close}&type=MARKET&quantity={qty}&positionSide={side}")
 
 def place_order(symbol, side, pos_side, qty, leverage=3):
     api_post("/fapi/v1/leverage", f"symbol={symbol}&leverage={leverage}")
-    return api_post("/fapi/v1/order", f"symbol={symbol}&side={side}&type=MARKET&quantity={qty}&positionSide={pos_side}")
+    step = _get_step_size(symbol)
+    exact_qty = _round_qty(qty, step)
+    return api_post("/fapi/v1/order", f"symbol={symbol}&side={side}&type=MARKET&quantity={exact_qty}&positionSide={pos_side}")
 
 def set_leverage(symbol, lev): api_post("/fapi/v1/leverage", f"symbol={symbol}&leverage={lev}")
 
 def scan_market():
-    """按24h涨幅排行取前20名，不评分不过滤"""
+    """24h合约涨幅榜前20名（候选池，开仓评分由entry_timing决定）"""
     tickers = curl_get("https://fapi.binance.com/fapi/v1/ticker/24hr")
     if not tickers: return None
     valid = [t for t in tickers if t['symbol'].endswith('USDT')
-             and not any(x in t['symbol'] for x in ['USDC','BUSD','FDUSD','TUSD','USDP'])
+             and not any(x in t['symbol'] for x in ['USDC','BUSD','FDUSD','USDP'])
+             and 'TUSD' not in t['symbol'].replace('USDT','')
              and float(t.get('quoteVolume',0)) >= 100000]
-    gainers = sorted(valid, key=lambda x: float(x['priceChangePercent']), reverse=True)
-    funding = curl_get("https://fapi.binance.com/fapi/v1/premiumIndex")
-    fr_map = {f['symbol']: float(f['lastFundingRate']) for f in funding} if funding else {}
 
+    valid.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
     signals = []
-    for t in gainers[:20]:
-        sym, chg, vol, price = t['symbol'], float(t['priceChangePercent']), float(t['quoteVolume']), float(t['lastPrice'])
-        if chg < 5 or chg > 80 or vol < 300000: continue
-        fr = fr_map.get(sym, 0)
+    for t in valid[:20]:
+        sym = t['symbol']
+        price = float(t['lastPrice'])
+        chg24 = float(t['priceChangePercent'])
+        vol = float(t['quoteVolume'])
         pb = (float(t['highPrice']) - price) / float(t['highPrice']) * 100 if float(t['highPrice']) > 0 else 0
-        # 只用来排序，评分统一设为涨幅值方便显示
-        signals.append({"symbol": sym, "price": price, "change": chg, "volume": vol,
-                        "fundingRate": round(fr*100, 4), "pullback": round(pb, 1), "score": round(chg, 1)})
-    signals.sort(key=lambda x: x["change"], reverse=True)
+        signals.append({"symbol": sym, "price": price, "change": chg24, "volume": vol,
+                        "fundingRate": 0, "pullback": round(pb, 1), "score": round(chg24, 1)})
     return signals[:20]
 
 def format_status_header(balances, positions):
@@ -446,7 +540,7 @@ def entry_timing(symbol):
     k1h = get_klines(symbol, "1h", 6)
     t24 = curl_get(f"https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={symbol}")
     if not k15 or not k1h or not t24 or len(k15) < 6 or len(k1h) < 4:
-        return 30, "数据不足,保守入场"  # 数据不足时保守
+        return 30, "数据不足,保守入场", None, None, None  # 数据不足时保守
 
     price = k15[-1]["close"]
     high_24h = float(t24["highPrice"])
@@ -454,13 +548,26 @@ def entry_timing(symbol):
     high_15m = max(c["high"] for c in k15)
     low_15m = min(c["low"] for c in k15)
 
+    # ====== 硬性否决条件 ======
+
+    c15_t = (k15[-1]["close"] - k15[-4]["close"]) / k15[-4]["close"] * 100
+    h1h_t = (k1h[-1]["close"] - k1h[-3]["close"]) / k1h[-3]["close"] * 100
+
+    # 否决①：双周期都向下 → 不开
+    if c15_t <= 0 and h1h_t <= 0:
+        return 0, f"否决:15m向下({c15_t:+.1f}%)+1h向下({h1h_t:+.1f}%)", None, None, None
+
+    # 否决②：从24h高点回撤超过8% → 不开（涨幅已结束）
+    retrace = (high_24h - price) / high_24h * 100
+    if retrace > 8:
+        return 0, f"否决:24h高点回撤{retrace:.1f}%>8%", None, None, None
+
     score = 0
     reasons = []
 
     # ========== ① 趋势强度（30分） ==========
 
     # 15m斜率（最近4根15m）
-    c15_t = (k15[-1]["close"] - k15[-4]["close"]) / k15[-4]["close"] * 100
     if c15_t > 2:
         score += 10; reasons.append(f"15m强({c15_t:+.1f}%)")
     elif c15_t > 1:
@@ -468,10 +575,9 @@ def entry_timing(symbol):
     elif c15_t > 0:
         score += 2; reasons.append(f"15m弱({c15_t:+.1f}%)")
     else:
-        reasons.append(f"15m向下({c15_t:+.1f}%)")
+        score -= 5; reasons.append(f"15m向下({c15_t:+.1f}%)->弱势-5")
 
     # 1h斜率（最近3根1h）
-    h1h_t = (k1h[-1]["close"] - k1h[-3]["close"]) / k1h[-3]["close"] * 100
     if h1h_t > 3:
         score += 10; reasons.append(f"1h强({h1h_t:+.1f}%)")
     elif h1h_t > 1:
@@ -479,7 +585,7 @@ def entry_timing(symbol):
     elif h1h_t > 0:
         score += 2; reasons.append(f"1h弱({h1h_t:+.1f}%)")
     else:
-        reasons.append(f"1h向下({h1h_t:+.1f}%)")
+        score -= 8; reasons.append(f"1h向下({h1h_t:+.1f}%)->弱势-8")
 
     # 多周期共振
     if c15_t > 0 and h1h_t > 0:
@@ -500,18 +606,38 @@ def entry_timing(symbol):
     else:
         score -= 5; reasons.append("下跌放量")
 
-    # 见顶信号（长上影线）
-    has_upper_wick = False
-    for c in k15[-3:]:
-        body = abs(c["close"] - c["open"])
-        upper_wick = c["high"] - max(c["open"], c["close"])
-        if body > 0 and upper_wick > body * 1.5:
-            has_upper_wick = True
-            break
-    if not has_upper_wick:
-        score += 10; reasons.append("无见顶信号")
+    # 见顶信号：用15m+1h高点趋势综合判断
+    # 取最近6根15m线和最近3根1h线
+    recent_6 = k15[-6:]
+    recent_3h = k1h[-3:]
+    highs_descending = all(recent_6[i]["high"] >= recent_6[i+1]["high"] for i in range(len(recent_6)-1))
+    lows_descending = all(recent_6[i]["low"] >= recent_6[i+1]["low"] for i in range(len(recent_6)-1))
+    highs_ascending = all(recent_6[i]["high"] <= recent_6[i+1]["high"] for i in range(len(recent_6)-1))
+    h1_ascending = all(recent_3h[i]["high"] <= recent_3h[i+1]["high"] for i in range(len(recent_3h)-1))
+    h1_descending = all(recent_3h[i]["high"] >= recent_3h[i+1]["high"] for i in range(len(recent_3h)-1))
+
+    # 只要15m或1h有一个在突破新高就视为强势
+    if highs_ascending or h1_ascending:
+        # 高点不断抬高 → 强势延续
+        score += 10; reasons.append("15m高点不断抬高->强势" if highs_ascending else "1h高点不断抬高->强势")
+        # 检查是否有长上影线但后续仍破高 → 插针确认
+        has_upper_wick = False
+        for c in k15[-3:]:
+            body = abs(c["close"] - c["open"])
+            upper_wick = c["high"] - max(c["open"], c["close"])
+            if body > 0 and upper_wick > body * 1.5:
+                has_upper_wick = True; break
+        if has_upper_wick and (highs_ascending or h1_ascending):
+            score += 5; reasons.append("上影线后继续破高->插针洗盘")
+    elif highs_descending and lows_descending:
+        # 高点和低点都在降低 → 真见顶，越陡峭扣越多
+        high_drop = (recent_6[0]["high"] - recent_6[-1]["high"]) / recent_6[-1]["high"] * 100
+        penalty = -min(25, max(-10, -high_drop * 2))
+        if penalty < -10:
+            score += penalty; reasons.append(f"高点持续走低({high_drop:.1f}%)->见顶信号{penalty}")
     else:
-        score -= 5; reasons.append("有上影线")
+        # 普通震荡，不扣分
+        reasons.append("15m震荡盘整")
 
     # 买盘优势
     up_count = sum(1 for c in recent if c["close"] >= c["open"])
@@ -521,33 +647,32 @@ def entry_timing(symbol):
     elif up_count >= 3:
         score += 5; reasons.append(f"买盘略优({up_count}阳)")
 
-    # ====== 超买惩罚（2026-05-31 新增）：连续阳线过多=超买衰竭风险 ======
-    # 检查最近15根15m K线，如果阳线比例>=80%则惩罚
-    k15_extended = get_klines(symbol, "15m", 15)
-    if k15_extended and len(k15_extended) >= 12:
-        total_green = sum(1 for c in k15_extended if c["close"] >= c["open"])
-        green_ratio = total_green / len(k15_extended)
-        if green_ratio >= 0.80:
-            penalty = -15; reasons.append(f"超买惩罚(15m阳{total_green}/{len(k15_extended)}={green_ratio:.0%})")
-            score += penalty
-        elif green_ratio >= 0.70:
-            penalty = -8; reasons.append(f"偏热(15m阳{total_green}/{len(k15_extended)}={green_ratio:.0%})")
-            score += penalty
+    # ====== 超买判断：15m或1h任意一个在突破新高就豁免 ======
+    if not highs_ascending and not h1_ascending:
+        k15_extended = get_klines(symbol, "15m", 15)
+        if k15_extended and len(k15_extended) >= 12:
+            total_green = sum(1 for c in k15_extended if c["close"] >= c["open"])
+            green_ratio = total_green / len(k15_extended)
+            if green_ratio >= 0.80:
+                penalty = -10; reasons.append(f"超买(15m阳{total_green}/{len(k15_extended)}={green_ratio:.0%})")
+                score += penalty
 
-    # ========== ③ 上涨空间（40分） ==========
+    # ========== ③ 上涨空间（30分） ==========
 
-    # 离24h最高点距离
+    # 取消"距离24h高点远就给分"的逻辑（跌得越深分越高，有悖入场逻辑）
+    # 改为：只看压力位远近和突破信号
+    
+    # 判断15m和1h是否都在向上（强势突破模式）
+    c15_up = (k15[-1]["close"] - k15[-4]["close"]) / k15[-4]["close"] * 100 > 0
+    h1_up = (k1h[-1]["close"] - k1h[-3]["close"]) / k1h[-3]["close"] * 100 > 0
+    both_up = c15_up and h1_up
     space_to_high = (high_24h - price) / price * 100 if price > 0 else 0
-    if space_to_high > 15:
-        score += 20; reasons.append(f"空间{space_to_high:.0f}%->宽裕")
-    elif space_to_high > 10:
-        score += 15; reasons.append(f"空间{space_to_high:.0f}%->良好")
-    elif space_to_high > 5:
-        score += 10; reasons.append(f"空间{space_to_high:.0f}%->中等")
-    elif space_to_high > 3:
-        score += 5; reasons.append(f"空间{space_to_high:.0f}%->偏小")
-    else:
-        reasons.append(f"空间{space_to_high:.0f}%->见顶风险")
+
+    # 极近/逼近新高 + 双周期向上 → 真实破信号
+    if space_to_high <= 2 and both_up:
+        score += 15; reasons.append(f"破新高在即({space_to_high:.1f}%)+双周期向上->真突破+15")
+    elif space_to_high <= 5 and both_up:
+        score += 12; reasons.append(f"逼近前高({space_to_high:.1f}%)+双周期向上->突破酝酿+12")
 
     # 近端压力位（15m周期最高点）
     d2_r = (high_15m - price) / price * 100 if price > 0 else 0
@@ -570,10 +695,83 @@ def entry_timing(symbol):
     near_resist = round(high_15m, 6)
     far_resist = round(high_24h, 6)
 
+    # ====== 创新高检测：6小时跨度看币的突破能力 ======
+    k15_24 = get_klines(symbol, "15m", 24)
+    if k15_24 and len(k15_24) >= 20:
+        high_6h = max(c["high"] for c in k15_24)  # 6小时内最高点
+        recent_high = max(c["high"] for c in k15_24[-12:])  # 最近3小时最高点
+
+        if high_6h > 0:
+            break_ratio = recent_high / high_6h
+
+            # ✅ 持续创新高：最近3h高点 >= 6h高点的99.8%
+            # 但需叠加趋势条件：15m或1h至少有一个在向上，否则可能是假突破
+            c15_up = (k15[-1]["close"] - k15[-4]["close"]) / k15[-4]["close"] * 100 > 0 if len(k15) >= 4 else False
+            h1_up = (k1h[-1]["close"] - k1h[-3]["close"]) / k1h[-3]["close"] * 100 > 0 if len(k1h) >= 4 else False
+            if break_ratio >= 0.998 and (c15_up or h1_up):
+                if break_ratio >= 1.0:
+                    score += 15; reasons.append(f"破6h新高+{((break_ratio-1)*100):.2f}%->强势延续+15")
+                else:
+                    score += 10; reasons.append(f"逼近6h新高({(break_ratio*100):.1f}%)->突破酝酿+10")
+            elif break_ratio >= 0.998 and not (c15_up or h1_up):
+                # 逼近前高但趋势向下 → 可能是假突破/双顶，不扣分也不加分
+                reasons.append(f"逼近前高({(break_ratio*100):.1f}%)但趋势向下-观望")
+
+            # ❌ 弱势反弹：最近3h高点远低于6h高点
+            elif break_ratio < 0.995:
+                sc_file = os.path.expanduser("~/.hermes/scripts/stop_cooldown.json")
+                has_stop = False
+                if os.path.exists(sc_file):
+                    try:
+                        with open(sc_file) as f:
+                            sc_data = json.load(f)
+                        prev_stop = sc_data.get(symbol, {}).get("count", 0)
+                        has_stop = prev_stop > 0
+                    except:
+                        pass
+                if has_stop:
+                    score -= 50; reasons.append(f"止损后弱势反弹未破新高({(break_ratio-1)*100:.1f}%)-否决")
+                else:
+                    score -= 25; reasons.append(f"弱势反弹未破新高({(break_ratio-1)*100:.1f}%)")
+
+    # ====== 止损次数惩罚：止损越多，扣分越多 ======
+    sc_file = os.path.expanduser("~/.hermes/scripts/stop_cooldown.json")
+    if os.path.exists(sc_file):
+        try:
+            with open(sc_file) as f:
+                sc_data = json.load(f)
+        except:
+            sc_data = {}
+        sc_entry = sc_data.get(symbol, {})
+        if isinstance(sc_entry, list):
+            stop_count = len(sc_entry)
+        else:
+            stop_count = sc_entry.get("count", 0)
+        if stop_count >= 4:
+            score -= 25; reasons.append(f"止损{stop_count}次->重罚-25")
+        elif stop_count >= 3:
+            score -= 15; reasons.append(f"止损{stop_count}次->罚-15")
+        elif stop_count >= 2:
+            score -= 8; reasons.append(f"止损{stop_count}次->罚-8")
+        elif stop_count == 1:
+            score -= 3; reasons.append(f"止损被打过->轻度-3")
+
     return score, "; ".join(reasons), (entry_low, entry_high), near_resist, far_resist
 
 
+def cooldown_seconds(count):
+    """阶梯冷却时长：1次→1h, 2次→6h, 3次→12h, 4次→48h"""
+    if count >= 4: return 172800  # 48h
+    if count >= 3: return 43200   # 12h
+    if count >= 2: return 21600   # 6h
+    if count >= 1: return 3600    # 1h
+    return 0
+
+NEW_TRADES_ENABLED = True  # 设为False暂停开新仓
+
 def place_new_trade(signals=None):
+    if not NEW_TRADES_ENABLED:
+        return None
     if not signals:
         signals = scan_market()
     if not signals: return None
@@ -584,25 +782,49 @@ def place_new_trade(signals=None):
     avail = balances["USDT"]["available"]; cnt = len(positions) if positions else 0
     if cnt >= 6: return None
 
+    # 加载全局止损冷却（阶梯式：3次→1h, 4次→5h, 5次→24h）
+    sc_file = os.path.expanduser("~/.hermes/scripts/stop_cooldown.json")
+    sc_data = {}
+    if os.path.exists(sc_file):
+        try:
+            with open(sc_file) as f: sc_data = json.load(f)
+        except: pass
+    now_ts = time.time()
+
     # 按scan_market评分从高到低遍历，入场时机过滤，第一个过线的就开
     for best in signals[:20]:
         if best["symbol"] in existing: continue
+
+        # 🔥 止损冷却检查：兼容两种数据格式（旧版list/新版dict）
+        sc_entry = sc_data.get(best["symbol"], {})
+        if isinstance(sc_entry, list):
+            # 旧格式：时间戳列表 → 转为dict格式（只处理前3次）
+            stop_count = len([t for t in sc_entry if time.time() - t < 86400])  # 24h内
+            cooldown_until = 0
+        else:
+            stop_count = sc_entry.get("count", 0)
+            cooldown_until = sc_entry.get("cooldown_until", 0)
+        if stop_count >= 3 and now_ts < cooldown_until:
+            remain = int(cooldown_until - now_ts)
+            print(f"  ⏳ {best['symbol']} 已止损{stop_count}次, 冷却中({remain//60}m{remain%60}s)")
+            continue
+        # 冷却过期了就清零重新计数
+        if stop_count >= 3 and now_ts >= cooldown_until:
+            sc_data[best["symbol"]] = {"count": 0, "cooldown_until": 0}
+
         price = best["price"]
 
         timing, timing_reason, entry_range, near_resist, far_resist = entry_timing(best["symbol"])
         if timing < 40:
             continue  # 入场时机不过关就跳过，看下一个
 
-        # 仓位分层（2026-05-31 升级）：防止临界评分重仓
-        # >=75: 满仓10x/95u（趋势强+空间大+量价健康）
-        # 60-74: 半仓5x/55u（趋势尚可但有疑虑）
-        # 40-59: 轻仓3x/30u（临界入场，轻仓试探）
+        # 仓位分层：开仓金额固定40~80u，按评分调杠杆
         if timing >= 75:
-            leverage = 10; target_value = 95
+            leverage = 10; target_value = 90
         elif timing >= 60:
-            leverage = 5; target_value = 55
+            leverage = 8; target_value = 70
         else:
-            leverage = 3; target_value = 30
+            leverage = 5; target_value = 50
 
         max_value = min(target_value, avail * leverage * 0.6)
         if max_value < 10: continue
@@ -733,6 +955,14 @@ def main():
     btc_status, btc_desc, btc_coeff, btc_price = check_btc_market()
     msg.append(f"🟡 BTC: ${btc_price:.0f} {btc_desc}")
 
+    # 加载全局止损冷却（同一个标止损3次后冷却1小时）
+    sc_file = os.path.expanduser("~/.hermes/scripts/stop_cooldown.json")
+    sc_data = {}
+    if os.path.exists(sc_file):
+        try:
+            with open(sc_file) as f: sc_data = json.load(f)
+        except: pass
+
     signals = scan_market()
     tracker = load_tracker()
     pos_map = {p["symbol"]: p for p in positions} if positions else {}
@@ -742,91 +972,237 @@ def main():
         if sym not in pos_map:
             del tracker[sym]
 
-    # 移动止损 + 固定止盈
+    # ========== 持仓处理：强趋势分层止盈止损体系 ==========
     if positions:
         for p in positions:
-            mark = get_mark_price(p["symbol"])
+            sym = p["symbol"]
+            mark = get_mark_price(sym)
             if not mark: continue
             entry = p["entry"]
-            pnl_pct = (mark - entry) / entry * 100 if p["amt"] > 0 else (entry - mark) / entry * 100
-            sym = p["symbol"]
+            side = p["side"]
+            amt = p["amt"]
+            pnl_pct = (mark - entry) / entry * 100 if amt > 0 else (entry - mark) / entry * 100
 
-            # 更新最高价追踪
-            tr = tracker.get(sym, {"high": mark, "trail_sl": None, "tp_triggered": False, "entry_score": 50})
+            # 取tracker状态（默认值）
+            tr = tracker.get(sym, {"high": mark, "trail_sl": None, "entry_score": 50})
             entry_score = tr.get("entry_score", 50)
-            if pnl_pct > 0 and mark > tr.get("high", 0):
-                tr["high"] = mark
-                # 价格创新高，调整移动止损 — 强趋势宽松，弱趋势收紧
-                trail_pct = 0.94 if entry_score >= 60 else 0.95  # 强趋势回撤6%，弱趋势回撤5%
-                tr["trail_sl"] = round(mark * trail_pct, 8)
-            tracker[sym] = tr
 
-            # ① 动态硬止损：根据入场评分调整止损幅度
-            loss = (entry - mark) / entry * 100 if p["amt"] > 0 else (mark - entry) / entry * 100
-            sl_pct = 7 if entry_score >= 60 else 5  # 强趋势扛7%，弱趋势5%就砍
-            if sl_pct <= loss < 50:
-                r = close_position(p["symbol"], p["side"], p["amt"])
+            # 阶段0：硬止损 -5% 兜底
+            loss = (entry - mark) / entry * 100 if amt > 0 else (mark - entry) / entry * 100
+            if loss <= -5:
+                r = close_position(sym, side, amt)
                 if "orderId" in r:
-                    msg.append(f"🛑 硬止损! {sym} 亏损{loss:.2f}% (入场评分{entry_score})")
-                else: msg.append(f"⚠️ {sym} 止损失败: {r.get('msg','?')}")
+                    msg.append(f"🛑 硬止损! {sym} 亏损{loss:.2f}%")
+                    tr["stop_count"] = tr.get("stop_count", 0) + 1
+                    tracker[sym] = tr
+                    sc_entry2 = sc_data.get(sym, {"count": 0, "cooldown_until": 0})
+                    sc_entry2["count"] = sc_entry2["count"] + 1
+                    cd_sec = cooldown_seconds(sc_entry2["count"])
+                    sc_entry2["cooldown_until"] = time.time() + cd_sec
+                    sc_data[sym] = sc_entry2
+                    with open(sc_file, "w") as _f: json.dump(sc_data, _f)
+                else:
+                    msg.append(f"⚠️ {sym} 硬止损失败: {r.get('msg','?')}")
                 tracker.pop(sym, None)
                 save_tracker(tracker)
                 continue
 
-            # ② 移动止损：从高点回撤触发（保护利润）
-            if pnl_pct > 0 and tr.get("trail_sl"):
-                trail_check = (mark - tr["trail_sl"]) / tr["trail_sl"] * 100
-                if trail_check < 0:
-                    r = close_position(p["symbol"], p["side"], p["amt"])
-                    if "orderId" in r: msg.append(f"⚠️ 移动止损! {sym} 高点回撤锁定利润")
-                    else: msg.append(f"⚠️ {sym} 移动止损失败: {r.get('msg','?')}")
+            # 阶段1：结构止损（跌破15m前低 / 结构破坏）
+            struct_triggered, struct_reason, struct_price = _check_structural_stop(sym, entry, amt, side)
+            if struct_triggered:
+                # 但如果有大周期向上保护（hold_score足够高），不触发结构止损
+                _, _, _, rpt = analyze_position(sym, entry, amt)
+                if rpt.get("hold", 0) >= rpt.get("sl", 0) + 10:
+                    # hold 明显高于 sl，说明大周期还在向上，结构止损暂缓
+                    msg.append(f"⚠️ {sym} 结构走弱但大周期hold{rpt['hold']}>sl{rpt['sl']}+10, 暂缓止损")
+                else:
+                    r = close_position(sym, side, amt)
+                    if "orderId" in r:
+                        msg.append(f"🔴 结构止损! {sym} {struct_reason}")
+                        tr["stop_count"] = tr.get("stop_count", 0) + 1
+                        tracker[sym] = tr
+                        sc_entry2 = sc_data.get(sym, {"count": 0, "cooldown_until": 0})
+                        sc_entry2["count"] = sc_entry2["count"] + 1
+                        cd_sec = cooldown_seconds(sc_entry2["count"])
+                        sc_entry2["cooldown_until"] = time.time() + cd_sec
+                        sc_data[sym] = sc_entry2
+                        with open(sc_file, "w") as _f: json.dump(sc_data, _f)
+                    else:
+                        msg.append(f"⚠️ {sym} 结构止损失败: {r.get('msg','?')}")
                     tracker.pop(sym, None)
                     save_tracker(tracker)
                     continue
 
-            # ③ 固定止盈移除 — 完全由评分系统动态判断止盈
-            # 只有硬止损保留：-7%硬止损
+            # ======== 更新tracker中的最高价追踪 ========
+            if pnl_pct > 0 and mark > tr.get("high", 0):
+                tr["high"] = mark
+            tracker[sym] = tr
 
-    save_tracker(tracker)
-    # 智能评分
-    if positions:
-        for p in positions:
-            sym = p["symbol"]
-            # 已被固定止盈/移动止损平仓的跳过
-            if sym not in tracker: continue
-            action, reason, conf, rpt = analyze_position(p["symbol"], p["entry"], p["amt"])
-            e = "🟢" if rpt.get("pnl_pct", 0) > 0 else "🔴"
-            if action == "tp" or action == "sl":
-                if action == "tp" and rpt.get("pnl_pct", 0) < 0:
-                    label = "止损(趋势走弱)"
-                elif action == "tp":
-                    label = "止盈"
-                else:
-                    label = "止损"
-                r = close_position(p["symbol"], p["side"], p["amt"])
+            # ======== 调用评分系统 ========
+            action, reason, conf, rpt = analyze_position(sym, entry, amt)
+            tp_s = rpt.get("tp", 0)
+            hd_s = rpt.get("hold", 0)
+            sl_s = rpt.get("sl", 0)
+
+            total_s = tp_s + hd_s + sl_s
+            hold_ratio = hd_s / total_s if total_s > 0 else 0.5
+
+            e = "🟢" if pnl_pct > 0 else "🔴"
+
+            # ======== 阶段2：评分止损执行 ========
+            # 2a) sl_score >= 85 → 强制平仓
+            if sl_s >= 85:
+                r = close_position(sym, side, amt)
                 if "orderId" in r:
-                    msg.append(f"💰 {label}! {p['symbol']} ⭐{rpt['tp']}/{rpt['hold']}/{rpt['sl']} {reason}")
+                    msg.append(f"🔴 评分强制止损! {sym} sl{sl_s}⭐ {reason}")
+                    tr["stop_count"] = tr.get("stop_count", 0) + 1
+                    tracker[sym] = tr
+                    sc_entry2 = sc_data.get(sym, {"count": 0, "cooldown_until": 0})
+                    sc_entry2["count"] = sc_entry2["count"] + 1
+                    cd_sec = cooldown_seconds(sc_entry2["count"])
+                    sc_entry2["cooldown_until"] = time.time() + cd_sec
+                    sc_data[sym] = sc_entry2
+                    with open(sc_file, "w") as _f: json.dump(sc_data, _f)
+                else:
+                    msg.append(f"⚠️ {sym} 强制止损失败: {r.get('msg','?')}")
+                tracker.pop(sym, None)
+                save_tracker(tracker)
+                continue
+
+            # 2b) sl_score >= 70 → 走弱预警，减仓40%+收紧止损
+            if sl_s >= 70:
+                reduce_qty = round(amt * 0.4, 8)
+                if reduce_qty > 0:
+                    r = close_position(sym, side, reduce_qty)
+                    if "orderId" in r:
+                        msg.append(f"⚠️ 走弱减仓! {sym}-40% sl{sl_s}⭐ {reason}")
+                        tr["sl_warn"] = True
+                        tr["trail_sl"] = round(entry * 0.99, 8)  # 收紧到成本价99%
+                        tr["high"] = mark
+                        tracker[sym] = tr
+                        save_tracker(tracker)
+                    else:
+                        msg.append(f"⚠️ {sym} 减仓失败: {r.get('msg','?')}")
+                # 减仓后如果剩余为0则跳过
+                remaining = amt - reduce_qty
+                if remaining <= 0:
                     tracker.pop(sym, None)
                     save_tracker(tracker)
+                    continue
+                # 更新amt为剩余量
+                amt = remaining
+                pnl_pct = (mark - entry) / entry * 100 if amt > 0 else (entry - mark) / entry * 100
+
+            # ======== 阶段3：分层减持止盈 ========
+            # 更新tracker中的最高价
+            if pnl_pct > 0 and mark > tr.get("high", 0):
+                tr["high"] = mark
+            tracker[sym] = tr
+
+            executed = False
+
+            # 3a) PnL >= 25% → 三级减持：保留40%-60%尾仓
+            if pnl_pct >= 25:
+                if hd_s >= 70:
+                    # 强趋势：保留60%尾仓
+                    reduce_pct = 0.4
                 else:
-                    msg.append(f"⚠️ {p['symbol']} 平仓失败: {r.get('msg','?')}")
+                    # 弱趋势：保留40%尾仓
+                    reduce_pct = 0.6
+                reduce_qty = round(amt * reduce_pct, 8)
+                if reduce_qty > 0:
+                    r = close_position(sym, side, reduce_qty)
+                    if "orderId" in r:
+                        remain_pct = round((1-reduce_pct)*100)
+                        msg.append(f"💰 止盈减仓! {sym} PnL{pnl_pct:.1f}% hold{hd_s}⭐ 保留{remain_pct}%尾仓")
+                        tr["reduce_3"] = True
+                        tr["trail_sl"] = round(entry * 1.01, 8)  # 止损推到成本线1%以上
+                        tracker[sym] = tr
+                        save_tracker(tracker)
+                        executed = True
+                    else:
+                        msg.append(f"⚠️ {sym} 止盈减仓失败: {r.get('msg','?')}")
+                if executed:
+                    continue
+
+            # 3b) PnL 15%~25% → 二级减持
+            if pnl_pct >= 15 and pnl_pct < 25:
+                if hd_s >= 70:
+                    # 强趋势：不大幅减仓，继续持有
+                    msg.append(f"🟢 {sym} PnL{pnl_pct:.1f}% hold{hd_s}⭐ 强趋势持有, 不止盈")
+                else:
+                    # 弱趋势：减仓30%
+                    reduce_qty = round(amt * 0.3, 8)
+                    if reduce_qty > 0:
+                        r = close_position(sym, side, reduce_qty)
+                        if "orderId" in r:
+                            msg.append(f"💰 二级止盈! {sym} PnL{pnl_pct:.1f}% hold{hd_s}⭐ 减仓30%")
+                            tr["reduce_2"] = True
+                            tracker[sym] = tr
+                            save_tracker(tracker)
+                            executed = True
+                        else:
+                            msg.append(f"⚠️ {sym} 止盈减仓失败: {r.get('msg','?')}")
+                if executed:
+                    continue
+
+            # 3c) PnL 8%~15% → 一级减持：减25%，止损推到成本价
+            if pnl_pct >= 8 and pnl_pct < 15:
+                reduce_qty = round(amt * 0.25, 8)
+                if reduce_qty > 0:
+                    r = close_position(sym, side, reduce_qty)
+                    if "orderId" in r:
+                        msg.append(f"💰 一级止盈! {sym} PnL{pnl_pct:.1f}% 减25%推成本")
+                        tr["reduce_1"] = True
+                        tr["trail_sl"] = round(entry, 8)  # 止损推到成本价
+                        tracker[sym] = tr
+                        save_tracker(tracker)
+                        executed = True
+                    else:
+                        msg.append(f"⚠️ {sym} 止盈减仓失败: {r.get('msg','?')}")
+                if executed:
+                    continue
+
+            # ======== 阶段4：移动止损（PnL >= 8%才启动） ========
+            if pnl_pct >= 8:
+                trail_pct = _calc_trail_sl(entry_score, hd_s)
+                trail_sl_price = round(tr.get("high", mark) * (1 - trail_pct), 8)
+                # 更新移动止损线（只会上调不会下调）
+                if tr.get("trail_sl") is None or trail_sl_price > tr["trail_sl"]:
+                    tr["trail_sl"] = trail_sl_price
+                # 检查是否触发
+                if mark < tr["trail_sl"]:
+                    r = close_position(sym, side, amt)
+                    if "orderId" in r:
+                        msg.append(f"⚠️ 移动止损! {sym} 从高点回撤{trail_pct*100:.0f}%触发")
+                    else:
+                        msg.append(f"⚠️ {sym} 移动止损失败: {r.get('msg','?')}")
+                    tracker.pop(sym, None)
+                    save_tracker(tracker)
+                    continue
+                tracker[sym] = tr
             else:
-                tp_s = rpt.get('tp', 0)
-                hd_s = rpt.get('hold', 0)
-                sl_s = rpt.get('sl', 0)
-                total_s = tp_s + hd_s + sl_s
-                composite = round(hd_s / total_s * 100) if total_s > 0 else 50
-                if composite >= 70: verdict = "建议持有 ✅"
-                elif composite >= 50: verdict = "中性观察 ⚠️"
-                else: verdict = "建议关注 ❌"
-                msg.append(f"{e} {p['symbol']} {rpt['pnl_pct']:+.2f}% 📊综合{composite}分 {verdict} | {reason}")
+                # PnL < 8%: 不启动移动止损，只更新最高价
+                if pnl_pct > 0:
+                    tracker[sym] = tr
+
+            # ======== 阶段5：评分跟踪报告 ========
+            if hd_s >= 70:
+                verdict = "持有 ✅"
+            elif hd_s >= 50:
+                verdict = "观察 ⚠️"
+            else:
+                verdict = "关注 ❌"
+            msg.append(f"{e} {sym} {pnl_pct:+.2f}% 📊 {hd_s}/{sl_s}/{tp_s}⭐ {verdict} | {reason}")
+
+    save_tracker(tracker)
     cnt = len(positions) if positions else 0
     # 🚦 BTC不限制开仓，仅作参考（2026-05-31用户要求取消所有限制）
     # 只保留冷却提醒，不阻止开仓
     # 当日亏损停盘已取消 — 评分严格把关，自负盈亏
 
     # 开仓：只检查持仓上限，不限制
-    max_pos = 6
+    max_pos = 7
     if len(positions) < max_pos and signals:
         t = place_new_trade(signals)
         if t: 
