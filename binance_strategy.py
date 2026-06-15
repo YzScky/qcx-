@@ -831,11 +831,11 @@ def place_new_trade(signals=None):
     # 仓位分层：开仓金额固定50~100u，按评分调杠杆
     timing = best["timing"]
     if timing >= 75:
-        leverage = 10; target_value = 100
+        leverage = 10; target_value = 90
     elif timing >= 60:
         leverage = 8; target_value = 80
     else:
-        leverage = 5; target_value = 60
+        leverage = 5; target_value = 70
 
     max_value = min(target_value, avail * leverage * 0.6)
     if max_value < 10: return None
