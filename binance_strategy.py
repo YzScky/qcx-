@@ -501,7 +501,7 @@ def scan_market():
 
     valid.sort(key=lambda x: float(x['priceChangePercent']), reverse=True)
     signals = []
-    for t in valid[:20]:
+    for t in valid[:40]:
         sym = t['symbol']
         price = float(t['lastPrice'])
         chg24 = float(t['priceChangePercent'])
@@ -509,7 +509,7 @@ def scan_market():
         pb = (float(t['highPrice']) - price) / float(t['highPrice']) * 100 if float(t['highPrice']) > 0 else 0
         signals.append({"symbol": sym, "price": price, "change": chg24, "volume": vol,
                         "fundingRate": 0, "pullback": round(pb, 1), "score": round(chg24, 1)})
-    return signals[:20]
+    return signals[:40]
 
 def format_status_header(balances, positions):
     now = datetime.now().strftime("%m/%d %H:%M")
@@ -793,7 +793,7 @@ def place_new_trade(signals=None):
 
     # 先扫全部候选，计算每个币的入场评分，选timing最高的开
     candidates = []
-    for best in signals[:20]:
+    for best in signals[:40]:
         if best["symbol"] in existing: continue
 
         # 🔥 止损冷却检查：兼容两种数据格式（旧版list/新版dict）
